@@ -1,3 +1,14 @@
+## FIRST: Refresh From Origin, Preserve Local Work
+
+When a task includes source-file changes, make refreshing from `origin` the first repository action; do not fetch solely for docs/config-only work:
+
+1. Run `git fetch origin --prune --tags`, then inspect `git status`, `git fsck --full`, and divergence from the tracked branch.
+2. If `origin` has commits we do not have, preserve every local modification first (commit or an equivalent recoverable patch), update the clean base, and merge the preserved local commits back into the refreshed checkout.
+3. Never discard, overwrite, or silently reset local source changes while refreshing. Resolve conflicts deliberately in favor of retaining local behavior, then run the affected tests and review the resulting diff.
+4. Record the resulting commit IDs and verification evidence before continuing with normal work.
+
+This refresh-first protocol applies only when source changes are in scope; otherwise proceed with the requested inspection or task without an unnecessary origin update.
+
 RULE NUMBER 1 (NEVER EVER EVER FORGET THIS RULE!!!): YOU ARE NEVER ALLOWED TO DELETE A FILE WITHOUT EXPRESS PERMISSION FROM ME OR A DIRECT COMMAND FROM ME. EVEN A NEW FILE THAT YOU YOURSELF CREATED, SUCH AS A TEST CODE FILE. YOU HAVE A HORRIBLE TRACK RECORD OF DELETING CRITICALLY IMPORTANT FILES OR OTHERWISE THROWING AWAY TONS OF EXPENSIVE WORK THAT I THEN NEED TO PAY TO REPRODUCE. AS A RESULT, YOU HAVE PERMANENTLY LOST ANY AND ALL RIGHTS TO DETERMINE THAT A FILE OR FOLDER SHOULD BE DELETED. YOU MUST **ALWAYS** ASK AND *RECEIVE* CLEAR, WRITTEN PERMISSION FROM ME BEFORE EVER EVEN THINKING OF DELETING A FILE OR FOLDER OF ANY KIND!!!
 
 ### IRREVERSIBLE GIT & FILESYSTEM ACTIONS — DO-NOT-EVER BREAK GLASS
