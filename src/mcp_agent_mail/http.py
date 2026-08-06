@@ -12,16 +12,16 @@ import json
 import logging
 import re
 from collections.abc import MutableMapping
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Protocol, cast
 
 import structlog
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request, status
+from fastapi import FastAPI, Form, HTTPException, Request, status
 from fastapi.exception_handlers import http_exception_handler
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 from sqlalchemy.exc import NoResultFound
@@ -30,6 +30,7 @@ from starlette.types import Receive, Scope, Send
 
 from .app import (
     _expire_stale_file_reservations,
+    _ensure_project,
     _tool_metrics_snapshot,
     build_mcp_server,
     get_project_sibling_data,
@@ -67,6 +68,78 @@ async def _project_slug_from_id(pid: int | None) -> str | None:
         row = await session.execute(text("SELECT slug FROM projects WHERE id = :pid"), {"pid": pid})
         res = row.fetchone()
         return res[0] if res and res[0] else None
+
+
+async def _purge_retained_messages(settings: Settings) -> int:
+    """Delete stale, fully read, or fully acknowledged messages beyond retention."""
+
+    max_delete = max(1, int(settings.mail_retention_max_delete_per_run))
+    cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(
+        days=max(1, int(settings.mail_retention_age_days))
+    )
+    async with get_session() as session:
+        rows = await session.execute(
+            text(
+                """
+                SELECT m.id
+                FROM messages m
+                WHERE
+                    m.created_ts < :cutoff
+                    OR (
+                        m.ack_required = 0
+                        AND EXISTS (
+                            SELECT 1 FROM message_recipients mr
+                            WHERE mr.message_id = m.id
+                        )
+                        AND NOT EXISTS (
+                            SELECT 1 FROM message_recipients mr
+                            WHERE mr.message_id = m.id AND mr.read_ts IS NULL
+                        )
+                        AND (
+                            SELECT MAX(mr.read_ts) FROM message_recipients mr
+                            WHERE mr.message_id = m.id
+                        ) < :cutoff
+                    )
+                    OR (
+                        m.ack_required = 1
+                        AND EXISTS (
+                            SELECT 1 FROM message_recipients mr
+                            WHERE mr.message_id = m.id
+                        )
+                        AND NOT EXISTS (
+                            SELECT 1 FROM message_recipients mr
+                            WHERE mr.message_id = m.id AND mr.ack_ts IS NULL
+                        )
+                        AND (
+                            SELECT MAX(mr.ack_ts) FROM message_recipients mr
+                            WHERE mr.message_id = m.id
+                        ) < :cutoff
+                    )
+                ORDER BY m.created_ts ASC
+                LIMIT :max_delete
+                """
+            ),
+            {"cutoff": cutoff, "max_delete": max_delete},
+        )
+        message_ids = [int(row[0]) for row in rows.fetchall()]
+        if not message_ids:
+            return 0
+        await session.execute(
+            text(
+                "DELETE FROM message_recipients "
+                "WHERE message_id IN (SELECT value FROM json_each(:message_ids))"
+            ),
+            {"message_ids": json.dumps(message_ids)},
+        )
+        await session.execute(
+            text(
+                "DELETE FROM messages "
+                "WHERE id IN (SELECT value FROM json_each(:message_ids))"
+            ),
+            {"message_ids": json.dumps(message_ids)},
+        )
+        await session.commit()
+        return len(message_ids)
 
 
 __all__ = ["build_http_app", "main"]
@@ -912,6 +985,22 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                                 )
                 await asyncio.sleep(max(60, settings.retention_report_interval_seconds))
 
+        async def _worker_mail_retention_cleanup() -> None:
+            log = structlog.get_logger("maintenance")
+            while True:
+                try:
+                    await ensure_schema()
+                    deleted = await _purge_retained_messages(settings)
+                    if deleted:
+                        log.info(
+                            "mail_retention_cleanup",
+                            deleted=deleted,
+                            retention_age_days=int(settings.mail_retention_age_days),
+                        )
+                except Exception as exc:
+                    log.warning("mail_retention_cleanup_failed", error=str(exc))
+                await asyncio.sleep(max(60, int(settings.mail_retention_cleanup_interval_seconds)))
+
         async def _worker_fd_health() -> None:
             """Periodic file descriptor health monitor.
 
@@ -996,6 +1085,8 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             tasks.append(asyncio.create_task(_worker_tool_metrics()))
         if settings.retention_report_enabled or settings.quota_enabled:
             tasks.append(asyncio.create_task(_worker_retention_quota()))
+        if settings.mail_retention_cleanup_enabled:
+            tasks.append(asyncio.create_task(_worker_mail_retention_cleanup()))
         fastapi_app.state._background_tasks = tasks
 
     async def _shutdown() -> None:  # pragma: no cover - service lifecycle
@@ -1406,10 +1497,10 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             css_sanitizer=_css_sanitizer,
         )
 
-        async def _render(name: str, **ctx: Any) -> HTMLResponse:
+        async def _render(name: str, status_code: int = 200, **ctx: Any) -> HTMLResponse:
             tpl = env.get_template(name)
             html = await tpl.render_async(**ctx)
-            return HTMLResponse(html)
+            return HTMLResponse(html, status_code=status_code)
 
         def _parse_fts_query(
             raw: str, scope_preference: str | None = None
@@ -1624,10 +1715,12 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
 
         @fastapi_app.get("/mail/api/unified-inbox", response_class=JSONResponse)
         async def mail_unified_inbox_api(
-            limit: int = 50000,
+            limit: int = 500,
             include_projects: bool = False,
         ) -> JSONResponse:
             """JSON feed for the unified inbox view (used for background refresh)."""
+            # Keep the default small so refresh callers do not accidentally
+            # request the whole mailbox history on every poll.
 
             payload = await _build_unified_inbox_payload(limit=limit, include_projects=include_projects)
             if not include_projects:
@@ -1926,6 +2019,49 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 raise
             except Exception as exc:
                 raise HTTPException(status_code=500, detail=f"Failed to unarchive project: {exc!s}") from exc
+
+        @fastapi_app.get("/mail/projects/new", response_class=HTMLResponse)
+        async def mail_project_create_form() -> HTMLResponse:
+            """Render the human project creation form."""
+            await ensure_schema()
+            return await _render(
+                "mail_project_create.html",
+                human_key="",
+                error=None,
+            )
+
+        @fastapi_app.post("/mail/projects/new", response_model=None)
+        async def mail_project_create_submit(human_key: str = Form(...)) -> Any:
+            """Create or ensure a project from a human-supplied absolute path."""
+            await ensure_schema()
+            submitted_human_key = human_key.strip()
+            if not submitted_human_key:
+                return await _render(
+                    "mail_project_create.html",
+                    human_key=submitted_human_key,
+                    error="Project path is required.",
+                    status_code=400,
+                )
+            if not Path(submitted_human_key).is_absolute():
+                return await _render(
+                    "mail_project_create.html",
+                    human_key=submitted_human_key,
+                    error="Project path must be an absolute directory path.",
+                    status_code=400,
+                )
+
+            try:
+                project = await _ensure_project(submitted_human_key)
+                await ensure_archive(settings, project.slug)
+            except Exception as exc:
+                return await _render(
+                    "mail_project_create.html",
+                    human_key=submitted_human_key,
+                    error=f"Failed to create project: {exc!s}",
+                    status_code=500,
+                )
+
+            return RedirectResponse(url=f"/mail/{project.slug}", status_code=status.HTTP_303_SEE_OTHER)
 
         @fastapi_app.get("/mail/projects", response_class=HTMLResponse)
         async def mail_projects_list() -> HTMLResponse:

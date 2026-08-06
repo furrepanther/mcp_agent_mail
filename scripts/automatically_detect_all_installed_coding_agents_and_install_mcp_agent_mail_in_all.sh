@@ -16,6 +16,15 @@ parse_common_flags "$@"
 require_cmd uv
 require_cmd curl
 
+NO_RESTART=0
+for arg in "$@"; do
+  case "$arg" in
+    --no-restart|--configure-only)
+      NO_RESTART=1
+      ;;
+  esac
+done
+
 log_step "MCP Agent Mail: Auto-detect and Integrate with Installed Coding Agents"
 echo
 echo "This will detect local agent configs under ~/.claude, ~/.codex, ~/.cursor, ~/.factory, ~/.gemini and generate per-agent MCP configs."
@@ -186,6 +195,11 @@ if [[ -n "${TARGET_DIR}" ]]; then
 fi
 echo "Client configs written in project root (e.g., *.mcp.json) and .claude/settings.json (if Claude present)."
 echo "All done."
+
+if [[ "$NO_RESTART" == "1" ]]; then
+  echo "Server restart skipped (--no-restart); Agent Mail wiring is complete."
+  exit 0
+fi
 
 
 # Exact restart behavior requested: kill 8765/tcp and start server in foreground with full output

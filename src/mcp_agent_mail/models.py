@@ -92,6 +92,7 @@ class Message(SQLModel, table=True):
         Index("idx_messages_project_created", "project_id", "created_ts"),
         Index("idx_messages_project_sender_created", "project_id", "sender_id", "created_ts"),
         Index("idx_messages_project_topic", "project_id", "topic"),
+        Index("idx_messages_external_sender", "external_sender_host", "external_message_id"),
     )
 
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -104,10 +105,94 @@ class Message(SQLModel, table=True):
     importance: str = Field(default="normal", max_length=16)
     ack_required: bool = Field(default=False)
     created_ts: datetime = Field(default_factory=_utcnow_naive)
+    external_sender_host: Optional[str] = Field(default=None, max_length=64)
+    external_sender_name: Optional[str] = Field(default=None, max_length=128)
+    external_message_id: Optional[str] = Field(default=None, max_length=128)
+    external_project_key: Optional[str] = Field(default=None, max_length=255)
+    external_thread_id: Optional[str] = Field(default=None, max_length=128)
+    bridge_dedupe_id: Optional[str] = Field(default=None, max_length=255, index=True)
     attachments: list[dict[str, Any]] = Field(
         default_factory=list,
         sa_column=Column(JSON, nullable=False, server_default="[]"),
     )
+
+
+class AgentMailPeer(SQLModel, table=True):
+    """Configured remote Agent Mail peer."""
+
+    __tablename__ = "agent_mail_peers"
+    __table_args__ = (
+        UniqueConstraint("host_key", name="uq_agent_mail_peer_host_key"),
+        Index("idx_agent_mail_peers_enabled", "enabled"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    host_key: str = Field(max_length=64, index=True)
+    display_name: str = Field(max_length=128)
+    api_url: str = Field(default="", max_length=512)
+    project_key: str = Field(default="", max_length=255)
+    auth_token_hash: Optional[str] = Field(default=None, max_length=128)
+    enabled: bool = Field(default=True)
+    last_health: Optional[str] = Field(default=None, max_length=32)
+    created_ts: datetime = Field(default_factory=_utcnow_naive)
+    updated_ts: datetime = Field(default_factory=_utcnow_naive)
+
+
+class AgentMailRemoteIdentity(SQLModel, table=True):
+    """Cached identity discovered from a remote Agent Mail peer."""
+
+    __tablename__ = "agent_mail_remote_identities"
+    __table_args__ = (
+        UniqueConstraint("host_key", "agent_name", "remote_project_key", name="uq_agent_mail_remote_identity"),
+        Index("idx_agent_mail_remote_identity_host", "host_key", "agent_name"),
+        Index("idx_agent_mail_remote_identity_status", "status"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    host_key: str = Field(max_length=64, index=True)
+    agent_name: str = Field(max_length=128, index=True)
+    remote_project_key: str = Field(default="", max_length=255)
+    program: str = Field(default="", max_length=128)
+    model: str = Field(default="", max_length=128)
+    capabilities: list[str] = Field(
+        default_factory=list,
+        sa_column=Column(JSON, nullable=False, server_default="[]"),
+    )
+    status: str = Field(default="active", max_length=32)
+    last_seen_ts: datetime = Field(default_factory=_utcnow_naive)
+    updated_ts: datetime = Field(default_factory=_utcnow_naive)
+
+
+class AgentMailBridgeDelivery(SQLModel, table=True):
+    """Local durable delivery state for cross-host Agent Mail."""
+
+    __tablename__ = "agent_mail_bridge_deliveries"
+    __table_args__ = (
+        UniqueConstraint("bridge_id", name="uq_agent_mail_bridge_id"),
+        Index("idx_agent_mail_bridge_status", "status"),
+        Index("idx_agent_mail_bridge_dest", "dest_host", "dest_agent"),
+        Index("idx_agent_mail_bridge_local_message", "local_message_id"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    bridge_id: str = Field(max_length=128, index=True)
+    local_message_id: Optional[int] = Field(default=None, foreign_key="messages.id", index=True)
+    source_host: str = Field(max_length=64)
+    source_agent: str = Field(max_length=128)
+    source_project_key: str = Field(default="", max_length=255)
+    dest_host: str = Field(max_length=64, index=True)
+    dest_agent: str = Field(max_length=128, index=True)
+    dest_project_key: str = Field(default="", max_length=255)
+    remote_message_id: Optional[str] = Field(default=None, max_length=128)
+    status: str = Field(default="queued", max_length=32)
+    attempts: int = Field(default=0)
+    last_error: str = Field(default="", max_length=2048)
+    created_ts: datetime = Field(default_factory=_utcnow_naive)
+    updated_ts: datetime = Field(default_factory=_utcnow_naive)
+    delivered_ts: Optional[datetime] = Field(default=None)
+    read_ts: Optional[datetime] = Field(default=None)
+    ack_ts: Optional[datetime] = Field(default=None)
+    completed_ts: Optional[datetime] = Field(default=None)
 
 
 class FileReservation(SQLModel, table=True):

@@ -1300,6 +1300,8 @@ async def _ensure_repo(root: Path, settings: Settings) -> Repo:
 
 
 async def write_agent_profile(archive: ProjectArchive, agent: Mapping[str, object]) -> None:
+    if not archive.settings.storage.archive_files_enabled:
+        return
     profile_path = archive.root / "agents" / str(agent["name"]) / "profile.json"
     await _write_json(profile_path, dict(agent))
     rel = profile_path.relative_to(archive.repo_root).as_posix()
@@ -1319,6 +1321,8 @@ async def write_file_reservation_records(
     archive: ProjectArchive,
     file_reservations: Sequence[dict[str, object]],
 ) -> None:
+    if not archive.settings.storage.archive_files_enabled:
+        return
     if not file_reservations:
         return
     rel_paths: list[str] = []
@@ -1362,6 +1366,8 @@ async def write_message_bundle(
     extra_paths: Sequence[str] | None = None,
     commit_text: str | None = None,
 ) -> None:
+    if not archive.settings.storage.archive_files_enabled:
+        return
     timestamp_obj: Any = message.get("created") or message.get("created_ts")
     now: datetime
     timestamp_str: str  # Always define to avoid UnboundLocalError
@@ -1561,6 +1567,24 @@ async def process_attachments(
     attachments_meta: list[dict[str, object]] = []
     commit_paths: list[str] = []
     updated_body = body_md
+    if not archive.settings.storage.archive_files_enabled:
+        if attachment_paths:
+            raise ValueError("Attachment files require STORAGE_ARCHIVE_FILES_ENABLED=true.")
+        if "data:image" in body_md:
+            for m in _IMAGE_PATTERN.finditer(body_md):
+                raw_path = m.group("path")
+                if raw_path.startswith("data:"):
+                    try:
+                        header = raw_path.split(",", 1)[0]
+                        media_type = "image/webp"
+                        if ";" in header:
+                            mt = header[5:].split(";", 1)[0]
+                            if mt:
+                                media_type = mt
+                        attachments_meta.append({"type": "inline", "media_type": media_type})
+                    except Exception:
+                        attachments_meta.append({"type": "inline"})
+        return updated_body, attachments_meta, commit_paths
     # Respect explicit convert_markdown decision; embed_policy ("inline"/"file") forces conversion
     should_convert = convert_markdown or embed_policy in {"inline", "file"}
     if should_convert:
@@ -2061,6 +2085,8 @@ async def _commit(
         use_queue: If True, use commit queue for potential batching (default True)
     """
     if not rel_paths:
+        return
+    if not settings.storage.git_commits_enabled:
         return
 
     working_tree = repo.working_tree_dir

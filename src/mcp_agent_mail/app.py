@@ -18,6 +18,7 @@ import secrets
 import shlex
 import shutil
 import subprocess
+import sys
 import time
 from collections import defaultdict, deque
 from collections.abc import AsyncIterator, Sequence
@@ -27,14 +28,15 @@ from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from functools import wraps
 from pathlib import Path
-from typing import Any, AsyncContextManager, Callable, Optional, Protocol, cast
+from typing import Any, AsyncContextManager, Callable, Mapping, Optional, Protocol, cast
 from urllib.parse import parse_qsl
 import uuid
 
+import httpx
 from fastmcp import Context, FastMCP
 from git import Repo
 from git.exc import InvalidGitRepositoryError, NoSuchPathError
-from sqlalchemy import and_ as _sa_and, asc as _sa_asc, bindparam, delete as _sa_delete, desc as _sa_desc, exists as _sa_exists, func, or_ as _sa_or, select as _sa_select, text, update as _sa_update
+from sqlalchemy import and_ as _sa_and, asc as _sa_asc, bindparam, case, delete as _sa_delete, desc as _sa_desc, exists as _sa_exists, func, or_ as _sa_or, select as _sa_select, text, update as _sa_update
 from sqlalchemy.exc import IntegrityError, NoResultFound, OperationalError, TimeoutError as SATimeoutError
 from sqlalchemy.orm import aliased
 
@@ -56,6 +58,9 @@ from .llm import complete_system_user
 from .models import (
     Agent,
     AgentLink,
+    AgentMailBridgeDelivery,
+    AgentMailPeer,
+    AgentMailRemoteIdentity,
     FileReservation,
     Message,
     MessageRecipient,
@@ -97,6 +102,87 @@ except Exception:  # pragma: no cover - optional dependency fallback
     PathSpec = None
 
 logger = logging.getLogger(__name__)
+
+
+async def _mirror_message_to_memory_fabric(
+    settings: Settings,
+    project: Project,
+    sender: Agent,
+    recipients: Sequence[str],
+    payload: Mapping[str, Any],
+    body_md: str,
+) -> None:
+    if not settings.memory_fabric_mirror_enabled:
+        return
+
+    def _store() -> None:
+        client_lib = settings.memory_fabric_mirror_client_lib
+        if client_lib and client_lib not in sys.path:
+            sys.path.insert(0, client_lib)
+        from memfab_mcp_client import get_shared_memfab_client
+
+        created = str(payload.get("created_ts") or payload.get("created") or datetime.now(timezone.utc).isoformat())
+        message_id = payload.get("id", "")
+        subject = str(payload.get("subject") or "").strip()
+        content = "\n".join(
+            [
+                f"Agent Mail message {message_id}",
+                f"Project: {project.human_key}",
+                f"From: {sender.name}",
+                f"To: {', '.join(recipients)}",
+                f"Subject: {subject}",
+                f"Created: {created}",
+                "",
+                body_md.strip(),
+            ]
+        )
+        get_shared_memfab_client().call_tool(
+            "memory_store",
+            {
+                "content": content,
+                "event_type": "agent_mail_message",
+                "summary": f"{sender.name} -> {', '.join(recipients)}: {subject}",
+                "scope": "agent_mail",
+                "durability": "medium-term",
+                "source_runner": "Datacube",
+                "source_tool": "mcp_agent_mail",
+                "repo_or_system": project.human_key,
+                "component": "agent-mail",
+                "observed_at_utc": created,
+                "tags": ["agent-mail", project.slug, sender.name],
+            },
+        )
+
+    await asyncio.wait_for(
+        asyncio.to_thread(_store),
+        timeout=max(1, settings.memory_fabric_mirror_timeout_seconds),
+    )
+
+
+def _schedule_memory_fabric_mail_mirror(
+    settings: Settings,
+    project: Project,
+    sender: Agent,
+    recipients: Sequence[str],
+    payload: Mapping[str, Any],
+    body_md: str,
+) -> None:
+    if not settings.memory_fabric_mirror_enabled:
+        return
+    task = asyncio.create_task(
+        _mirror_message_to_memory_fabric(settings, project, sender, recipients, payload, body_md)
+    )
+
+    def _log_result(done: asyncio.Task[None]) -> None:
+        with suppress(asyncio.CancelledError):
+            exc = done.exception()
+            if exc is not None:
+                logger.warning(
+                    "memory_fabric.mail_mirror_failed",
+                    exc_info=(type(exc), exc, exc.__traceback__),
+                )
+
+    task.add_done_callback(_log_result)
 
 
 class _FastMCPToolGetter(Protocol):
@@ -1707,9 +1793,227 @@ def _message_to_dict(message: Message, include_body: bool = True) -> dict[str, A
         "created_ts": _iso(message.created_ts),
         "attachments": message.attachments,
     }
+    external_sender_host = getattr(message, "external_sender_host", None)
+    external_sender_name = getattr(message, "external_sender_name", None)
+    if external_sender_host or external_sender_name:
+        data["external_sender"] = {
+            "host": external_sender_host,
+            "name": external_sender_name,
+            "message_id": getattr(message, "external_message_id", None),
+            "project_key": getattr(message, "external_project_key", None),
+            "thread_id": getattr(message, "external_thread_id", None),
+            "bridge_dedupe_id": getattr(message, "bridge_dedupe_id", None),
+        }
     if include_body:
         data["body_md"] = message.body_md
     return data
+
+
+def _agent_mail_host_key() -> str:
+    raw = (
+        os.getenv("AGENT_MAIL_HOST_KEY", "")
+        or os.getenv("ANTIGRAVITY_PLATFORM_ID", "")
+        or os.getenv("AG_PLATFORM_ID", "")
+        or ""
+    ).strip()
+    if raw:
+        return raw
+    hostname = os.uname().nodename if hasattr(os, "uname") else ""
+    lowered = hostname.lower()
+    if lowered.startswith("datacube"):
+        return "Datacube"
+    if lowered.startswith("primus"):
+        return "Primus"
+    return hostname or "local"
+
+
+def _normalize_bridge_host(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", (value or "").strip().lower())
+
+
+def _is_local_bridge_host(host_key: str) -> bool:
+    normalized = _normalize_bridge_host(host_key)
+    local = _normalize_bridge_host(_agent_mail_host_key())
+    aliases = {_normalize_bridge_host(item) for item in os.getenv("AGENT_MAIL_LOCAL_HOST_ALIASES", "").split(",") if item.strip()}
+    aliases.update({local, "local", "localhost"})
+    return normalized in aliases
+
+
+def _split_bridge_recipient(candidate: str) -> tuple[str | None, str | None]:
+    text = (candidate or "").strip()
+    if not text or "@" not in text:
+        return None, text
+    agent_name, host_key = text.rsplit("@", 1)
+    agent_name = agent_name.strip()
+    host_key = host_key.strip()
+    if not agent_name or not host_key:
+        return None, text
+    return host_key, agent_name
+
+
+def _partition_bridge_recipients(recipients: Sequence[str], kind: str) -> tuple[list[str], list[dict[str, str]]]:
+    local: list[str] = []
+    remote: list[dict[str, str]] = []
+    for item in recipients:
+        host_key, agent_name = _split_bridge_recipient(item)
+        if host_key is None:
+            if agent_name:
+                local.append(agent_name)
+            continue
+        if _is_local_bridge_host(host_key):
+            local.append(agent_name or item)
+            continue
+        remote.append(
+            {
+                "input": item,
+                "kind": kind,
+                "host_key": host_key,
+                "agent_name": agent_name or item,
+            }
+        )
+    return local, remote
+
+
+def _public_peer_dict(peer: AgentMailPeer) -> dict[str, Any]:
+    return {
+        "id": peer.id,
+        "host_key": peer.host_key,
+        "display_name": peer.display_name,
+        "api_url": peer.api_url,
+        "project_key": peer.project_key,
+        "enabled": peer.enabled,
+        "last_health": peer.last_health,
+        "created_ts": _iso(peer.created_ts),
+        "updated_ts": _iso(peer.updated_ts),
+        "auth_configured": bool(peer.auth_token_hash),
+    }
+
+
+def _remote_identity_dict(identity: AgentMailRemoteIdentity) -> dict[str, Any]:
+    return {
+        "id": identity.id,
+        "host_key": identity.host_key,
+        "agent_name": identity.agent_name,
+        "remote_project_key": identity.remote_project_key,
+        "program": identity.program,
+        "model": identity.model,
+        "capabilities": identity.capabilities,
+        "status": identity.status,
+        "last_seen_ts": _iso(identity.last_seen_ts),
+        "updated_ts": _iso(identity.updated_ts),
+    }
+
+
+def _bridge_delivery_dict(delivery: AgentMailBridgeDelivery) -> dict[str, Any]:
+    def _nullable_iso(value: Any) -> str | None:
+        return _iso(value) if value is not None else None
+
+    return {
+        "id": delivery.id,
+        "bridge_id": delivery.bridge_id,
+        "local_message_id": delivery.local_message_id,
+        "source_host": delivery.source_host,
+        "source_agent": delivery.source_agent,
+        "source_project_key": delivery.source_project_key,
+        "dest_host": delivery.dest_host,
+        "dest_agent": delivery.dest_agent,
+        "dest_project_key": delivery.dest_project_key,
+        "remote_message_id": delivery.remote_message_id,
+        "status": delivery.status,
+        "attempts": delivery.attempts,
+        "last_error": delivery.last_error,
+        "created_ts": _iso(delivery.created_ts),
+        "updated_ts": _iso(delivery.updated_ts),
+        "delivered_ts": _nullable_iso(delivery.delivered_ts),
+        "read_ts": _nullable_iso(delivery.read_ts),
+        "ack_ts": _nullable_iso(delivery.ack_ts),
+        "completed_ts": _nullable_iso(delivery.completed_ts),
+    }
+
+
+def _bridge_peer_token_env_names(host_key: str) -> list[str]:
+    normalized = re.sub(r"[^A-Za-z0-9]+", "_", host_key.strip()).strip("_").upper()
+    names = []
+    if normalized:
+        names.extend(
+            [
+                f"AGENT_MAIL_BRIDGE_PEER_TOKEN_{normalized}",
+                f"ANTIGRAVITY_AGENT_MAIL_BRIDGE_PEER_TOKEN_{normalized}",
+            ]
+        )
+    names.extend(["AGENT_MAIL_BRIDGE_PEER_TOKEN", "ANTIGRAVITY_AGENT_MAIL_BRIDGE_PEER_TOKEN"])
+    return names
+
+
+def _bridge_outbound_peer_token(host_key: str) -> str:
+    for name in _bridge_peer_token_env_names(host_key):
+        value = os.getenv(name, "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _parse_mcp_tool_payload(raw_text: str) -> Any:
+    raw = str(raw_text or "").strip()
+    if not raw:
+        raise RuntimeError("empty MCP response body")
+    if raw.startswith("{"):
+        payload = json.loads(raw)
+    else:
+        data_lines = [line[5:].strip() for line in raw.splitlines() if line.startswith("data:")]
+        if not data_lines:
+            raise RuntimeError(f"unsupported MCP response body: {raw[:200]}")
+        payload = json.loads("\n".join(data_lines))
+    if not isinstance(payload, dict):
+        raise RuntimeError("MCP response is not a JSON object")
+    if "error" in payload:
+        raise RuntimeError(f"MCP error: {payload['error']}")
+    result = payload.get("result")
+    if not isinstance(result, dict):
+        return result
+    structured = result.get("structuredContent")
+    if structured is not None:
+        if isinstance(structured, dict) and "result" in structured:
+            return structured["result"]
+        return structured
+    for item in result.get("content") or []:
+        if not isinstance(item, dict) or item.get("type") != "text":
+            continue
+        text_value = str(item.get("text") or "").strip()
+        if not text_value:
+            continue
+        try:
+            return json.loads(text_value)
+        except json.JSONDecodeError:
+            return text_value
+    return result
+
+
+async def _call_bridge_peer_tool(
+    *,
+    api_url: str,
+    tool_name: str,
+    arguments: dict[str, Any],
+    timeout_s: float,
+) -> Any:
+    payload = {
+        "jsonrpc": "2.0",
+        "id": f"agent-mail-bridge-{int(time.time() * 1000)}",
+        "method": "tools/call",
+        "params": {"name": tool_name, "arguments": arguments},
+    }
+    async with httpx.AsyncClient(timeout=timeout_s) as client:
+        response = await client.post(
+            api_url,
+            json=payload,
+            headers={"Accept": "application/json, text/event-stream", "Content-Type": "application/json"},
+        )
+        response.raise_for_status()
+        return _parse_mcp_tool_payload(response.text)
+
+
+def _delivery_terminal_status(status: str) -> bool:
+    return status.strip().lower() in {"delivered", "completed", "read", "acknowledged", "failed"}
 
 
 def _message_frontmatter(
@@ -3447,6 +3751,12 @@ async def _create_message(
     thread_id: Optional[str],
     attachments: Sequence[dict[str, Any]],
     topic: Optional[str] = None,
+    external_sender_host: Optional[str] = None,
+    external_sender_name: Optional[str] = None,
+    external_message_id: Optional[str] = None,
+    external_project_key: Optional[str] = None,
+    external_thread_id: Optional[str] = None,
+    bridge_dedupe_id: Optional[str] = None,
 ) -> Message:
     if project.id is None:
         raise ValueError("Project must have an id before creating messages.")
@@ -3463,6 +3773,12 @@ async def _create_message(
             ack_required=ack_required,
             thread_id=thread_id,
             topic=topic,
+            external_sender_host=external_sender_host,
+            external_sender_name=external_sender_name,
+            external_message_id=external_message_id,
+            external_project_key=external_project_key,
+            external_thread_id=external_thread_id,
+            bridge_dedupe_id=bridge_dedupe_id,
             attachments=list(attachments),
         )
         session.add(message)
@@ -3477,6 +3793,351 @@ async def _create_message(
         await session.commit()
         await session.refresh(message)
     return message
+
+
+def _hash_bridge_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+async def _upsert_remote_identity_record(
+    *,
+    host_key: str,
+    agent_name: str,
+    remote_project_key: str,
+    program: str = "",
+    model: str = "",
+    capabilities: Sequence[str] | None = None,
+    status: str = "active",
+) -> AgentMailRemoteIdentity:
+    await ensure_schema()
+    now = _naive_utc()
+    normalized_host = host_key.strip()
+    normalized_agent = agent_name.strip()
+    normalized_project = remote_project_key.strip()
+    if not normalized_host or not normalized_agent:
+        raise ToolExecutionError(
+            "INVALID_ARGUMENT",
+            "Remote identity requires non-empty host_key and agent_name.",
+            recoverable=True,
+            data={"host_key": host_key, "agent_name": agent_name},
+        )
+    async with get_session() as session:
+        result = await session.execute(
+            select(AgentMailRemoteIdentity).where(
+                func.lower(AgentMailRemoteIdentity.host_key) == normalized_host.lower(),
+                func.lower(AgentMailRemoteIdentity.agent_name) == normalized_agent.lower(),
+                AgentMailRemoteIdentity.remote_project_key == normalized_project,
+            )
+        )
+        identity = result.scalars().first()
+        if identity is None:
+            identity = AgentMailRemoteIdentity(
+                host_key=normalized_host,
+                agent_name=normalized_agent,
+                remote_project_key=normalized_project,
+            )
+        identity.program = program
+        identity.model = model
+        identity.capabilities = list(capabilities or [])
+        identity.status = status
+        identity.last_seen_ts = now
+        identity.updated_ts = now
+        session.add(identity)
+        await session.commit()
+        await session.refresh(identity)
+        return identity
+
+
+async def _queue_bridge_deliveries(
+    *,
+    local_message_id: int | None,
+    project: Project,
+    sender: Agent,
+    remote_recipients: Sequence[dict[str, str]],
+) -> list[dict[str, Any]]:
+    if not remote_recipients:
+        return []
+    await ensure_schema()
+    now = _naive_utc()
+    source_host = _agent_mail_host_key()
+    queued: list[dict[str, Any]] = []
+    async with get_session() as session:
+        for recipient in remote_recipients:
+            host_key = recipient["host_key"].strip()
+            agent_name = recipient["agent_name"].strip()
+            identity_result = await session.execute(
+                select(AgentMailRemoteIdentity).where(
+                    func.lower(AgentMailRemoteIdentity.host_key) == host_key.lower(),
+                    func.lower(AgentMailRemoteIdentity.agent_name) == agent_name.lower(),
+                    AgentMailRemoteIdentity.remote_project_key == "",
+                )
+            )
+            identity = identity_result.scalars().first()
+            if identity is None:
+                identity = AgentMailRemoteIdentity(
+                    host_key=host_key,
+                    agent_name=agent_name,
+                    remote_project_key="",
+                    status="discovered",
+                )
+            identity.last_seen_ts = now
+            identity.updated_ts = now
+            session.add(identity)
+            bridge_seed = f"{source_host}:{project.human_key}:{local_message_id}:{host_key}:{agent_name}:{recipient.get('kind', 'to')}"
+            bridge_id = hashlib.sha256(bridge_seed.encode("utf-8")).hexdigest()[:32]
+            existing = await session.execute(
+                select(AgentMailBridgeDelivery).where(AgentMailBridgeDelivery.bridge_id == bridge_id)
+            )
+            delivery = existing.scalars().first()
+            if delivery is None:
+                delivery = AgentMailBridgeDelivery(
+                    bridge_id=bridge_id,
+                    local_message_id=local_message_id,
+                    source_host=source_host,
+                    source_agent=sender.name,
+                    source_project_key=project.human_key,
+                    dest_host=host_key,
+                    dest_agent=agent_name,
+                    dest_project_key="",
+                    status="queued",
+                    created_ts=now,
+                    updated_ts=now,
+                )
+            else:
+                delivery.updated_ts = now
+            session.add(delivery)
+            await session.flush()
+            queued.append(_bridge_delivery_dict(delivery))
+        await session.commit()
+    return queued
+
+
+async def _flush_bridge_deliveries_once(
+    *,
+    dest_host: str = "",
+    limit: int = 25,
+    max_attempts: int = 10,
+    timeout_s: float = 10.0,
+    include_blocked: bool = True,
+    stale_sending_after_s: int = 300,
+) -> dict[str, Any]:
+    await ensure_schema()
+    limit = max(1, min(100, int(limit)))
+    max_attempts = max(1, min(100, int(max_attempts)))
+    timeout_s = max(1.0, min(60.0, float(timeout_s)))
+    stale_cutoff = _naive_utc() - timedelta(seconds=max(30, stale_sending_after_s))
+    wanted_statuses = {"queued", "retry"}
+    if include_blocked:
+        wanted_statuses.add("blocked")
+    results: list[dict[str, Any]] = []
+    processed = 0
+
+    async with get_session() as session:
+        stmt = (
+            select(AgentMailBridgeDelivery)
+            .outerjoin(Message, Message.id == AgentMailBridgeDelivery.local_message_id)
+            .where(AgentMailBridgeDelivery.status.in_(list(wanted_statuses) + ["sending"]))
+            .order_by(
+                case(
+                    (func.lower(Message.importance).in_(["urgent", "high"]), 0),
+                    (func.lower(Message.importance).in_(["normal", "routine", "medium"]), 1),
+                    (func.lower(Message.importance).in_(["low", "background"]), 2),
+                    else_=1,
+                ),
+                AgentMailBridgeDelivery.created_ts.asc(),
+            )
+            .limit(limit * 4)
+        )
+        if dest_host:
+            stmt = stmt.where(func.lower(AgentMailBridgeDelivery.dest_host) == dest_host.strip().lower())
+        rows = await session.execute(stmt)
+        candidates = rows.scalars().all()
+
+    for delivery in candidates:
+        if processed >= limit:
+            break
+        status = (delivery.status or "").strip().lower()
+        if status == "sending" and delivery.updated_ts > stale_cutoff:
+            continue
+        if _delivery_terminal_status(status):
+            continue
+
+        async with get_session() as session:
+            current_result = await session.execute(
+                select(AgentMailBridgeDelivery).where(AgentMailBridgeDelivery.id == delivery.id)
+            )
+            current = current_result.scalars().first()
+            if current is None:
+                continue
+            current_status = (current.status or "").strip().lower()
+            if current_status == "sending" and current.updated_ts > stale_cutoff:
+                continue
+            if _delivery_terminal_status(current_status):
+                continue
+            message = None
+            if current.local_message_id is not None:
+                message_result = await session.execute(select(Message).where(Message.id == current.local_message_id))
+                message = message_result.scalars().first()
+            peer_result = await session.execute(
+                select(AgentMailPeer).where(func.lower(AgentMailPeer.host_key) == current.dest_host.lower())
+            )
+            peer = peer_result.scalars().first()
+            now = _naive_utc()
+            if message is None:
+                current.status = "failed"
+                current.last_error = "local message no longer exists"
+                current.updated_ts = now
+                session.add(current)
+                await session.commit()
+                results.append({**_bridge_delivery_dict(current), "transport_state": "failed"})
+                processed += 1
+                continue
+            if peer is None or not peer.enabled:
+                blocked_error = "bridge peer is not configured or disabled"
+                if current.status == "blocked" and current.last_error == blocked_error:
+                    continue
+                current.status = "blocked"
+                current.last_error = blocked_error
+                current.updated_ts = now
+                session.add(current)
+                await session.commit()
+                results.append({**_bridge_delivery_dict(current), "transport_state": "blocked"})
+                processed += 1
+                continue
+            if not peer.api_url.strip():
+                blocked_error = "bridge peer api_url is not configured"
+                if current.status == "blocked" and current.last_error == blocked_error:
+                    continue
+                current.status = "blocked"
+                current.last_error = blocked_error
+                current.updated_ts = now
+                session.add(current)
+                await session.commit()
+                results.append({**_bridge_delivery_dict(current), "transport_state": "blocked"})
+                processed += 1
+                continue
+            remote_project_key = current.dest_project_key.strip() or peer.project_key.strip()
+            if not remote_project_key:
+                blocked_error = "destination project_key is not configured"
+                if current.status == "blocked" and current.last_error == blocked_error:
+                    continue
+                current.status = "blocked"
+                current.last_error = blocked_error
+                current.updated_ts = now
+                session.add(current)
+                await session.commit()
+                results.append({**_bridge_delivery_dict(current), "transport_state": "blocked"})
+                processed += 1
+                continue
+
+            current.status = "sending"
+            current.attempts += 1
+            current.last_error = ""
+            current.updated_ts = now
+            session.add(current)
+            await session.commit()
+            delivery_snapshot = _bridge_delivery_dict(current)
+            peer_api_url = peer.api_url.strip()
+            peer_host_key = peer.host_key
+            subject = message.subject
+            body_md = message.body_md
+            thread_id = message.thread_id
+            topic = message.topic
+            importance = message.importance
+            ack_required = message.ack_required
+            local_message_id = message.id
+            source_host = current.source_host
+            source_agent = current.source_agent
+            source_project_key = current.source_project_key
+            dest_agent = current.dest_agent
+            bridge_id = current.bridge_id
+            attempt_count = current.attempts
+
+        args: dict[str, Any] = {
+            "project_key": remote_project_key,
+            "to": [dest_agent],
+            "subject": subject,
+            "body_md": body_md,
+            "source_host": source_host,
+            "source_agent": source_agent,
+            "source_project_key": source_project_key,
+            "external_message_id": str(local_message_id),
+            "external_thread_id": thread_id,
+            "bridge_dedupe_id": f"{source_host}:{local_message_id}:{peer_host_key}:{dest_agent}",
+            "bridge_id": bridge_id,
+            "importance": importance,
+            "ack_required": bool(ack_required),
+            "thread_id": thread_id,
+            "topic": topic,
+        }
+        peer_token = _bridge_outbound_peer_token(peer_host_key)
+        if peer_token:
+            args["peer_token"] = peer_token
+
+        try:
+            remote_payload = await _call_bridge_peer_tool(
+                api_url=peer_api_url,
+                tool_name="bridge_receive_message",
+                arguments=args,
+                timeout_s=timeout_s,
+            )
+            remote_message_id = ""
+            duplicate = False
+            if isinstance(remote_payload, dict):
+                remote_message_id = str(remote_payload.get("id") or "")
+                duplicate = bool(remote_payload.get("duplicate"))
+            async with get_session() as session:
+                current_result = await session.execute(
+                    select(AgentMailBridgeDelivery).where(AgentMailBridgeDelivery.id == delivery.id)
+                )
+                current = current_result.scalars().first()
+                if current is not None:
+                    now = _naive_utc()
+                    current.status = "delivered"
+                    current.remote_message_id = remote_message_id or current.remote_message_id
+                    current.delivered_ts = current.delivered_ts or now
+                    current.completed_ts = current.completed_ts or now
+                    current.last_error = ""
+                    current.updated_ts = now
+                    session.add(current)
+                    await session.commit()
+                    await session.refresh(current)
+                    result_payload = _bridge_delivery_dict(current)
+                else:
+                    result_payload = delivery_snapshot
+            result_payload.update({"transport_state": "delivered", "duplicate": duplicate})
+            results.append(result_payload)
+        except Exception as exc:
+            error_text = str(exc)[:2048]
+            async with get_session() as session:
+                current_result = await session.execute(
+                    select(AgentMailBridgeDelivery).where(AgentMailBridgeDelivery.id == delivery.id)
+                )
+                current = current_result.scalars().first()
+                if current is not None:
+                    now = _naive_utc()
+                    current.status = "failed" if attempt_count >= max_attempts else "retry"
+                    current.last_error = error_text
+                    current.updated_ts = now
+                    session.add(current)
+                    await session.commit()
+                    await session.refresh(current)
+                    result_payload = _bridge_delivery_dict(current)
+                else:
+                    result_payload = delivery_snapshot
+            result_payload.update({"transport_state": "failed" if attempt_count >= max_attempts else "retry"})
+            results.append(result_payload)
+        processed += 1
+
+    summary = {
+        "processed": processed,
+        "delivered": sum(1 for item in results if item.get("transport_state") == "delivered"),
+        "blocked": sum(1 for item in results if item.get("transport_state") == "blocked"),
+        "retry": sum(1 for item in results if item.get("transport_state") == "retry"),
+        "failed": sum(1 for item in results if item.get("transport_state") == "failed"),
+        "results": results,
+    }
+    return summary
 
 
 async def _create_file_reservation(
@@ -4902,6 +5563,15 @@ def build_mcp_server() -> FastMCP:
                             message_meta,
                         )
 
+            _schedule_memory_fabric_mail_mirror(
+                settings,
+                project,
+                sender,
+                recipients_for_archive,
+                payload,
+                processed_body,
+            )
+
         await ctx.info(
             f"Message {message.id} created by {sender.name} (to {', '.join(recipients_for_archive)})"
         )
@@ -6285,25 +6955,8 @@ def build_mcp_server() -> FastMCP:
                 data={"argument": "to", "received_type": type(to).__name__},
             )
 
-        # Check for common recipient mistakes and provide helpful guidance
-        for recipient in to:
-            if not isinstance(recipient, str):
-                raise ToolExecutionError(
-                    "INVALID_ARGUMENT",
-                    f"Each recipient in 'to' must be a string (agent name). Got: {type(recipient).__name__}",
-                    recoverable=True,
-                    data={"argument": "to", "invalid_item": repr(recipient)},
-                )
-            mistake = _detect_agent_name_mistake(recipient)
-            if mistake:
-                raise ToolExecutionError(
-                    mistake[0],
-                    f"Invalid recipient '{recipient}': {mistake[1]}",
-                    recoverable=True,
-                    data={"recipient": recipient, "hint": "Use agent names like 'BlueLake', not program/model names"},
-                )
-
-        # Normalize cc/bcc inputs and validate types for friendlier UX
+        # Normalize cc/bcc early so explicit Name@Host bridge recipients do not
+        # flow into local agent-name validation or cross-project project@ lookup.
         if isinstance(cc, str):
             cc = [cc]
         if isinstance(bcc, str):
@@ -6340,6 +6993,38 @@ def build_mcp_server() -> FastMCP:
                 recoverable=True,
                 data={"argument": "bcc"},
             )
+
+        remote_bridge_recipients: list[dict[str, str]] = []
+        to, remote_to = _partition_bridge_recipients(to, "to")
+        cc, remote_cc = _partition_bridge_recipients(cc or [], "cc")
+        bcc, remote_bcc = _partition_bridge_recipients(bcc or [], "bcc")
+        remote_bridge_recipients.extend(remote_to)
+        remote_bridge_recipients.extend(remote_cc)
+        remote_bridge_recipients.extend(remote_bcc)
+        if not to and not cc and not bcc and not remote_bridge_recipients:
+            raise ToolExecutionError(
+                "RECIPIENT_NOT_FOUND",
+                "At least one local or remote recipient must be specified.",
+                recoverable=True,
+            )
+
+        # Check for common recipient mistakes and provide helpful guidance
+        for recipient in to:
+            if not isinstance(recipient, str):
+                raise ToolExecutionError(
+                    "INVALID_ARGUMENT",
+                    f"Each recipient in 'to' must be a string (agent name). Got: {type(recipient).__name__}",
+                    recoverable=True,
+                    data={"argument": "to", "invalid_item": repr(recipient)},
+                )
+            mistake = _detect_agent_name_mistake(recipient)
+            if mistake:
+                raise ToolExecutionError(
+                    mistake[0],
+                    f"Invalid recipient '{recipient}': {mistake[1]}",
+                    recoverable=True,
+                    data={"recipient": recipient, "hint": "Use agent names like 'BlueLake', not program/model names"},
+                )
 
         # Self-send detection: warn if sender is sending to themselves
         sender_lower = sender_name.lower().strip()
@@ -7094,18 +7779,389 @@ def build_mcp_server() -> FastMCP:
                 logger.exception("Failed to deliver message to external project %r", p.human_key)
                 continue
 
+        bridge_deliveries: list[dict[str, Any]] = []
+        if remote_bridge_recipients:
+            local_message_id: int | None = None
+            for delivery in deliveries:
+                payload = delivery.get("payload")
+                if isinstance(payload, dict) and isinstance(payload.get("id"), int):
+                    local_message_id = payload["id"]
+                    break
+            if local_message_id is None:
+                audit_message = await _create_message(
+                    project,
+                    sender,
+                    subject,
+                    body_md,
+                    [],
+                    importance,
+                    ack_required,
+                    thread_id,
+                    [],
+                    topic=topic,
+                )
+                local_message_id = audit_message.id
+                audit_payload = _message_to_dict(audit_message)
+                audit_payload.update(
+                    {
+                        "from": sender.name,
+                        "to": [],
+                        "cc": [],
+                        "bcc": [],
+                        "remote_recipients": remote_bridge_recipients,
+                    }
+                )
+                deliveries.append({"project": project.human_key, "payload": audit_payload, "bridge_audit": True})
+            bridge_deliveries = await _queue_bridge_deliveries(
+                local_message_id=local_message_id,
+                project=project,
+                sender=sender,
+                remote_recipients=remote_bridge_recipients,
+            )
+            for item in bridge_deliveries:
+                deliveries.append(
+                    {
+                        "project": f"{item['dest_agent']}@{item['dest_host']}",
+                        "payload": item,
+                        "delivery_state": "queued_remote",
+                    }
+                )
+
         # If a single delivery returned a structured error payload, bubble it up to top-level
         if len(deliveries) == 1:
             maybe_payload = deliveries[0].get("payload")
             if isinstance(maybe_payload, dict) and isinstance(maybe_payload.get("error"), dict):
                 return {"error": maybe_payload["error"]}
         result: dict[str, Any] = {"deliveries": deliveries, "count": len(deliveries), "verified_sender": verified_sender}
+        if bridge_deliveries:
+            result["remote_delivery_state"] = "queued_remote"
+            result["bridge_deliveries"] = bridge_deliveries
         # Back-compat: expose top-level attachments when a single local delivery exists
         if len(deliveries) == 1:
             payload = deliveries[0].get("payload") or {}
             if isinstance(payload, dict) and "attachments" in payload:
                 result["attachments"] = payload.get("attachments")
         return result
+
+    @mcp.tool(name="list_identities")
+    @_instrument_tool(
+        "list_identities",
+        cluster=CLUSTER_IDENTITY,
+        capabilities={"identity", "read"},
+        project_arg="project_key",
+    )
+    async def list_identities(
+        ctx: Context,
+        project_key: str,
+        include_remote: bool = True,
+        host_key: Optional[str] = None,
+        status: Optional[str] = None,
+        limit: int = 500,
+        format: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """List local and cached remote identities for bridge-aware routing."""
+        project = await _get_project_by_identifier(project_key)
+        if limit < 1:
+            limit = 1
+        if limit > 1000:
+            limit = 1000
+        await ensure_schema()
+        async with get_session() as session:
+            local_rows = await session.execute(
+                select(Agent)
+                .where(cast(Any, Agent.project_id == project.id))
+                .order_by(Agent.name)
+                .limit(limit)
+            )
+            local = [_agent_to_dict(agent) for agent in local_rows.scalars().all()]
+            remote: list[dict[str, Any]] = []
+            if include_remote:
+                stmt = select(AgentMailRemoteIdentity).order_by(
+                    AgentMailRemoteIdentity.host_key,
+                    AgentMailRemoteIdentity.agent_name,
+                )
+                if host_key:
+                    stmt = stmt.where(func.lower(AgentMailRemoteIdentity.host_key) == host_key.strip().lower())
+                if status:
+                    stmt = stmt.where(func.lower(AgentMailRemoteIdentity.status) == status.strip().lower())
+                stmt = stmt.limit(limit)
+                remote_rows = await session.execute(stmt)
+                remote = [_remote_identity_dict(identity) for identity in remote_rows.scalars().all()]
+        await ctx.info(f"Listed {len(local)} local and {len(remote)} remote identities.")
+        return {
+            "project_key": project.human_key,
+            "host_key": _agent_mail_host_key(),
+            "local": local,
+            "remote": remote,
+        }
+
+    @mcp.tool(name="upsert_bridge_peer")
+    @_instrument_tool("upsert_bridge_peer", cluster=CLUSTER_IDENTITY, capabilities={"identity", "write"})
+    async def upsert_bridge_peer(
+        ctx: Context,
+        host_key: str,
+        display_name: Optional[str] = None,
+        api_url: str = "",
+        project_key: str = "",
+        auth_token: Optional[str] = None,
+        enabled: bool = True,
+        last_health: Optional[str] = None,
+        format: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Create or update a trusted Agent Mail peer without exposing stored tokens."""
+        normalized_host = host_key.strip()
+        if not normalized_host:
+            raise ToolExecutionError("INVALID_ARGUMENT", "host_key is required.", recoverable=True)
+        await ensure_schema()
+        now = _naive_utc()
+        async with get_session() as session:
+            result = await session.execute(
+                select(AgentMailPeer).where(func.lower(AgentMailPeer.host_key) == normalized_host.lower())
+            )
+            peer = result.scalars().first()
+            if peer is None:
+                peer = AgentMailPeer(host_key=normalized_host, display_name=display_name or normalized_host)
+                peer.created_ts = now
+            peer.display_name = display_name or peer.display_name or normalized_host
+            peer.api_url = api_url.strip()
+            peer.project_key = project_key.strip()
+            if auth_token:
+                peer.auth_token_hash = _hash_bridge_token(auth_token)
+            peer.enabled = enabled
+            if last_health is not None:
+                peer.last_health = last_health
+            peer.updated_ts = now
+            session.add(peer)
+            await session.commit()
+            await session.refresh(peer)
+        await ctx.info(f"Bridge peer upserted for host '{peer.host_key}'.")
+        return _public_peer_dict(peer)
+
+    @mcp.tool(name="bridge_upsert_remote_identity")
+    @_instrument_tool("bridge_upsert_remote_identity", cluster=CLUSTER_IDENTITY, capabilities={"identity", "write"})
+    async def bridge_upsert_remote_identity(
+        ctx: Context,
+        host_key: str,
+        agent_name: str,
+        remote_project_key: str = "",
+        program: str = "",
+        model: str = "",
+        capabilities: Optional[list[str]] = None,
+        status: str = "active",
+        format: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Register or refresh one remote identity discovered from a peer."""
+        identity = await _upsert_remote_identity_record(
+            host_key=host_key,
+            agent_name=agent_name,
+            remote_project_key=remote_project_key,
+            program=program,
+            model=model,
+            capabilities=capabilities or [],
+            status=status,
+        )
+        await ctx.info(f"Remote identity {identity.agent_name}@{identity.host_key} upserted.")
+        return _remote_identity_dict(identity)
+
+    @mcp.tool(name="bridge_receive_message")
+    @_instrument_tool(
+        "bridge_receive_message",
+        cluster=CLUSTER_MESSAGING,
+        capabilities={"messaging", "write"},
+        project_arg="project_key",
+    )
+    async def bridge_receive_message(
+        ctx: Context,
+        project_key: str,
+        to: list[str],
+        subject: str,
+        body_md: str,
+        source_host: str,
+        source_agent: str,
+        source_project_key: str = "",
+        external_message_id: Optional[str] = None,
+        external_thread_id: Optional[str] = None,
+        bridge_dedupe_id: Optional[str] = None,
+        bridge_id: Optional[str] = None,
+        peer_token: Optional[str] = None,
+        importance: str = "normal",
+        ack_required: bool = False,
+        thread_id: Optional[str] = None,
+        topic: Optional[str] = None,
+        bridge_agent_name: Optional[str] = None,
+        format: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Receive a message from a trusted peer while preserving remote provenance."""
+        project = await _get_project_by_identifier(project_key)
+        if isinstance(to, str):
+            to = [to]
+        if not to or any(not isinstance(item, str) or not item.strip() for item in to):
+            raise ToolExecutionError("INVALID_ARGUMENT", "to must contain at least one local agent name.", recoverable=True)
+        source_host = source_host.strip()
+        source_agent = source_agent.strip()
+        if not source_host or not source_agent:
+            raise ToolExecutionError(
+                "INVALID_ARGUMENT",
+                "source_host and source_agent are required.",
+                recoverable=True,
+            )
+        await ensure_schema()
+        async with get_session() as session:
+            peer_result = await session.execute(
+                select(AgentMailPeer).where(func.lower(AgentMailPeer.host_key) == source_host.lower())
+            )
+            peer = peer_result.scalars().first()
+            if peer is not None and peer.auth_token_hash:
+                if not peer_token or not hmac.compare_digest(_hash_bridge_token(peer_token), peer.auth_token_hash):
+                    raise ToolExecutionError(
+                        "AUTHENTICATION_REQUIRED",
+                        "Invalid or missing peer_token for bridge_receive_message.",
+                        recoverable=True,
+                    )
+            dedupe_key = bridge_dedupe_id or (
+                f"{source_host}:{external_message_id}" if external_message_id else ""
+            )
+            if dedupe_key:
+                existing = await session.execute(
+                    select(Message).where(Message.bridge_dedupe_id == dedupe_key).limit(1)
+                )
+                existing_message = existing.scalars().first()
+                if existing_message is not None:
+                    payload = _message_to_dict(existing_message)
+                    payload["duplicate"] = True
+                    return payload
+
+        await _upsert_remote_identity_record(
+            host_key=source_host,
+            agent_name=source_agent,
+            remote_project_key=source_project_key,
+            status="active",
+        )
+        local_bridge_agent_name = bridge_agent_name or os.getenv("AGENT_MAIL_BRIDGE_AGENT_NAME", "AmberGrove")
+        bridge_agent = await _get_or_create_agent(
+            project,
+            local_bridge_agent_name,
+            "agent-mail-bridge",
+            "bridge",
+            f"Bridge receiver for {source_host}",
+            settings,
+        )
+        recipient_map = await _get_agents_batch(project, [item.strip() for item in to])
+        recipients = [(recipient_map[item.strip()], "to") for item in to]
+        message = await _create_message(
+            project,
+            bridge_agent,
+            subject,
+            body_md,
+            recipients,
+            importance,
+            ack_required,
+            thread_id or external_thread_id,
+            [],
+            topic=topic,
+            external_sender_host=source_host,
+            external_sender_name=source_agent,
+            external_message_id=external_message_id,
+            external_project_key=source_project_key,
+            external_thread_id=external_thread_id,
+            bridge_dedupe_id=bridge_dedupe_id or (f"{source_host}:{external_message_id}" if external_message_id else None),
+        )
+        payload = _message_to_dict(message)
+        payload.update(
+            {
+                "from": f"{source_agent}@{source_host}",
+                "to": [item.strip() for item in to],
+                "cc": [],
+                "bcc": [],
+            }
+        )
+        if settings.notifications.enabled:
+            message_meta = {
+                "id": message.id,
+                "from": f"{source_agent}@{source_host}",
+                "subject": subject,
+                "importance": importance,
+                "source_host": source_host,
+            }
+            for agent in recipient_map.values():
+                with suppress(Exception):
+                    await emit_notification_signal(settings, project.slug, agent.name, message_meta)
+        _schedule_memory_fabric_mail_mirror(
+            settings,
+            project,
+            bridge_agent,
+            [item.strip() for item in to],
+            payload,
+            body_md,
+        )
+        if bridge_id:
+            async with get_session() as session:
+                delivery_result = await session.execute(
+                    select(AgentMailBridgeDelivery).where(AgentMailBridgeDelivery.bridge_id == bridge_id)
+                )
+                delivery = delivery_result.scalars().first()
+                if delivery is not None:
+                    delivery.remote_message_id = str(message.id)
+                    delivery.status = "delivered"
+                    delivery.delivered_ts = _naive_utc()
+                    delivery.updated_ts = _naive_utc()
+                    session.add(delivery)
+                    await session.commit()
+        await ctx.info(f"Bridge message {message.id} received from {source_agent}@{source_host}.")
+        return payload
+
+    @mcp.tool(name="list_bridge_deliveries")
+    @_instrument_tool("list_bridge_deliveries", cluster=CLUSTER_MESSAGING, capabilities={"messaging", "read"})
+    async def list_bridge_deliveries(
+        ctx: Context,
+        status: Optional[str] = None,
+        dest_host: Optional[str] = None,
+        limit: int = 100,
+        format: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        """Inspect queued/completed cross-host delivery state."""
+        if limit < 1:
+            limit = 1
+        if limit > 1000:
+            limit = 1000
+        await ensure_schema()
+        async with get_session() as session:
+            stmt = select(AgentMailBridgeDelivery).order_by(desc(AgentMailBridgeDelivery.created_ts)).limit(limit)
+            if status:
+                stmt = stmt.where(func.lower(AgentMailBridgeDelivery.status) == status.strip().lower())
+            if dest_host:
+                stmt = stmt.where(func.lower(AgentMailBridgeDelivery.dest_host) == dest_host.strip().lower())
+            rows = await session.execute(stmt)
+            deliveries = [_bridge_delivery_dict(item) for item in rows.scalars().all()]
+        await ctx.info(f"Listed {len(deliveries)} bridge deliveries.")
+        return deliveries
+
+    @mcp.tool(name="flush_bridge_deliveries")
+    @_instrument_tool("flush_bridge_deliveries", cluster=CLUSTER_MESSAGING, capabilities={"messaging", "write"})
+    async def flush_bridge_deliveries(
+        ctx: Context,
+        dest_host: Optional[str] = None,
+        limit: int = 25,
+        max_attempts: int = 10,
+        timeout_s: float = 10.0,
+        include_blocked: bool = True,
+        format: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Push queued cross-host deliveries to configured peer Agent Mail APIs."""
+        summary = await _flush_bridge_deliveries_once(
+            dest_host=dest_host or "",
+            limit=limit,
+            max_attempts=max_attempts,
+            timeout_s=timeout_s,
+            include_blocked=include_blocked,
+        )
+        await ctx.info(
+            "Bridge transport flush processed "
+            f"{summary['processed']} deliveries "
+            f"({summary['delivered']} delivered, {summary['blocked']} blocked, "
+            f"{summary['retry']} retry, {summary['failed']} failed)."
+        )
+        return summary
 
     @mcp.tool(
         name="purge_old_messages",

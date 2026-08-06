@@ -84,6 +84,8 @@ class StorageSettings:
     """Filesystem/Git storage configuration."""
 
     root: str
+    archive_files_enabled: bool
+    git_commits_enabled: bool
     git_author_name: str
     git_author_email: str
     inline_image_max_bytes: int
@@ -232,6 +234,10 @@ class Settings:
     retention_report_enabled: bool
     retention_report_interval_seconds: int
     retention_max_age_days: int
+    mail_retention_cleanup_enabled: bool
+    mail_retention_cleanup_interval_seconds: int
+    mail_retention_age_days: int
+    mail_retention_max_delete_per_run: int
     quota_enabled: bool
     quota_attachments_limit_bytes: int
     quota_inbox_limit_count: int
@@ -253,6 +259,10 @@ class Settings:
     window_identity_uuid: str
     # Days of inactivity before a window identity expires (default 30)
     window_identity_ttl_days: int
+    # Optional durable mail mirror for long-lived runner memory.
+    memory_fabric_mirror_enabled: bool
+    memory_fabric_mirror_client_lib: str
+    memory_fabric_mirror_timeout_seconds: int
 
 
 def _bool(value: str, *, default: bool) -> bool:
@@ -338,6 +348,8 @@ def get_settings() -> Settings:
     storage_settings = StorageSettings(
         # Default to a global, user-scoped archive directory outside the source tree
         root=_decouple_config("STORAGE_ROOT", default="~/.mcp_agent_mail_git_mailbox_repo"),
+        archive_files_enabled=_bool(_decouple_config("STORAGE_ARCHIVE_FILES_ENABLED", default="true"), default=True),
+        git_commits_enabled=_bool(_decouple_config("STORAGE_GIT_COMMITS_ENABLED", default="true"), default=True),
         git_author_name=_decouple_config("GIT_AUTHOR_NAME", default="mcp-agent"),
         git_author_email=_decouple_config("GIT_AUTHOR_EMAIL", default="mcp-agent@example.com"),
         inline_image_max_bytes=_int(_decouple_config("INLINE_IMAGE_MAX_BYTES", default=str(64 * 1024)), default=64 * 1024),
@@ -459,7 +471,11 @@ def get_settings() -> Settings:
         tool_metrics_emit_interval_seconds=_int(_decouple_config("TOOL_METRICS_EMIT_INTERVAL_SECONDS", default="60"), default=60),
         retention_report_enabled=_bool(_decouple_config("RETENTION_REPORT_ENABLED", default="false"), default=False),
         retention_report_interval_seconds=_int(_decouple_config("RETENTION_REPORT_INTERVAL_SECONDS", default="3600"), default=3600),
-        retention_max_age_days=_int(_decouple_config("RETENTION_MAX_AGE_DAYS", default="180"), default=180),
+        retention_max_age_days=_int(_decouple_config("RETENTION_MAX_AGE_DAYS", default="10"), default=10),
+        mail_retention_cleanup_enabled=_bool(_decouple_config("MAIL_RETENTION_CLEANUP_ENABLED", default="false"), default=False),
+        mail_retention_cleanup_interval_seconds=_int(_decouple_config("MAIL_RETENTION_CLEANUP_INTERVAL_SECONDS", default="3600"), default=3600),
+        mail_retention_age_days=_int(_decouple_config("MAIL_RETENTION_AGE_DAYS", default="10"), default=10),
+        mail_retention_max_delete_per_run=_int(_decouple_config("MAIL_RETENTION_MAX_DELETE_PER_RUN", default="1000"), default=1000),
         quota_enabled=_bool(_decouple_config("QUOTA_ENABLED", default="false"), default=False),
         quota_attachments_limit_bytes=_int(_decouple_config("QUOTA_ATTACHMENTS_LIMIT_BYTES", default="0"), default=0),
         quota_inbox_limit_count=_int(_decouple_config("QUOTA_INBOX_LIMIT_COUNT", default="0"), default=0),
@@ -472,6 +488,9 @@ def get_settings() -> Settings:
         messaging_auto_handshake_on_block=_bool(_decouple_config("MESSAGING_AUTO_HANDSHAKE_ON_BLOCK", default="true"), default=True),
         window_identity_uuid=_decouple_config("MCP_AGENT_MAIL_WINDOW_ID", default="").strip(),
         window_identity_ttl_days=_int(_decouple_config("MCP_AGENT_MAIL_WINDOW_TTL_DAYS", default="30"), default=30),
+        memory_fabric_mirror_enabled=_bool(_decouple_config("MEMORY_FABRIC_MIRROR_ENABLED", default="false"), default=False),
+        memory_fabric_mirror_client_lib=_decouple_config("MEMORY_FABRIC_MIRROR_CLIENT_LIB", default="").strip(),
+        memory_fabric_mirror_timeout_seconds=_int(_decouple_config("MEMORY_FABRIC_MIRROR_TIMEOUT_SECONDS", default="10"), default=10),
     )
 
 

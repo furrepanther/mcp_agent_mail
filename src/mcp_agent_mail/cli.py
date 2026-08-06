@@ -767,7 +767,14 @@ def serve_http(
     # monkeypatch uvicorn.run without the 'ws' parameter.
     import inspect as _inspect
     _sig = _inspect.signature(uvicorn.run)
-    _kwargs: dict[str, Any] = {"host": resolved_host, "port": resolved_port, "log_level": "info"}
+    uvicorn_log_level = os.getenv("AGENT_MAIL_UVICORN_LOG_LEVEL", "warning")
+    access_log_enabled = os.getenv("AGENT_MAIL_UVICORN_ACCESS_LOG", "0").strip().lower() in {"1", "true", "yes", "on"}
+    _kwargs: dict[str, Any] = {
+        "host": resolved_host,
+        "port": resolved_port,
+        "log_level": uvicorn_log_level,
+        "access_log": access_log_enabled,
+    }
     if "ws" in _sig.parameters:
         _kwargs["ws"] = "none"
     uvicorn.run(app, **_kwargs)
@@ -3567,6 +3574,132 @@ def projects_discovery_init(
         lines.append(f"product_uid: {product}")
     ypath.write_text("\n".join(lines) + "\n", encoding="utf-8")
     console.print(f"[green]Wrote[/] {ypath}")
+
+
+def _parse_bridge_mcp_response(raw_text: str) -> Any:
+    raw = str(raw_text or "").strip()
+    if not raw:
+        raise RuntimeError("empty MCP response body")
+    if raw.startswith("{"):
+        payload = json.loads(raw)
+    else:
+        data_lines = [line[5:].strip() for line in raw.splitlines() if line.startswith("data:")]
+        if not data_lines:
+            raise RuntimeError(f"unsupported MCP response body: {raw[:200]}")
+        payload = json.loads("\n".join(data_lines))
+    if not isinstance(payload, dict):
+        raise RuntimeError("MCP response is not a JSON object")
+    if "error" in payload:
+        raise RuntimeError(f"MCP error: {payload['error']}")
+    result = payload.get("result")
+    if not isinstance(result, dict):
+        return result
+    structured = result.get("structuredContent")
+    if structured is not None:
+        if isinstance(structured, dict) and "result" in structured:
+            return structured["result"]
+        return structured
+    for item in result.get("content") or []:
+        if not isinstance(item, dict) or item.get("type") != "text":
+            continue
+        text_value = str(item.get("text") or "").strip()
+        if not text_value:
+            continue
+        try:
+            return json.loads(text_value)
+        except json.JSONDecodeError:
+            return text_value
+    return result
+
+
+def _call_local_agent_mail_tool(api_url: str, tool_name: str, arguments: dict[str, Any], timeout_s: float) -> Any:
+    payload = {
+        "jsonrpc": "2.0",
+        "id": f"agent-mail-cli-{int(time.time() * 1000)}",
+        "method": "tools/call",
+        "params": {"name": tool_name, "arguments": arguments},
+    }
+    response = httpx.post(
+        api_url,
+        json=payload,
+        headers={"Accept": "application/json, text/event-stream", "Content-Type": "application/json"},
+        timeout=max(1.0, min(60.0, timeout_s)),
+    )
+    response.raise_for_status()
+    return _parse_bridge_mcp_response(response.text)
+
+
+@mail_app.command("bridge-flush")
+def mail_bridge_flush(
+    api_url: Annotated[str, typer.Option("--api-url", help="Local Agent Mail MCP HTTP endpoint.")] = "http://127.0.0.1:8766/api/",
+    dest_host: Annotated[str, typer.Option("--dest-host", help="Optional destination host filter.")] = "",
+    limit: Annotated[int, typer.Option("--limit", help="Maximum deliveries to process this run.")] = 25,
+    max_attempts: Annotated[int, typer.Option("--max-attempts", help="Maximum transport attempts before failed.")] = 10,
+    timeout_s: Annotated[float, typer.Option("--timeout-s", help="Peer API request timeout.")] = 10.0,
+    include_blocked: Annotated[bool, typer.Option("--include-blocked/--skip-blocked")] = True,
+) -> None:
+    """Run one bridge transport flush against the local Agent Mail service."""
+    result = _call_local_agent_mail_tool(
+        api_url,
+        "flush_bridge_deliveries",
+        {
+            "dest_host": dest_host,
+            "limit": limit,
+            "max_attempts": max_attempts,
+            "timeout_s": timeout_s,
+            "include_blocked": include_blocked,
+        },
+        timeout_s + 5.0,
+    )
+    console.print_json(data=result)
+
+
+@mail_app.command("bridge-transport-loop")
+def mail_bridge_transport_loop(
+    api_url: Annotated[str, typer.Option("--api-url", help="Local Agent Mail MCP HTTP endpoint.")] = "http://127.0.0.1:8766/api/",
+    interval_s: Annotated[
+        float,
+        typer.Option("--interval-s", help="Seconds between outbound bridge queue flushes."),
+    ] = float(os.getenv("AGENT_MAIL_BRIDGE_TRANSPORT_POLL_S", "5")),
+    dest_host: Annotated[str, typer.Option("--dest-host", help="Optional destination host filter.")] = "",
+    limit: Annotated[int, typer.Option("--limit", help="Maximum deliveries per flush.")] = int(
+        os.getenv("AGENT_MAIL_BRIDGE_TRANSPORT_LIMIT", "25")
+    ),
+    max_attempts: Annotated[int, typer.Option("--max-attempts", help="Maximum transport attempts before failed.")] = int(
+        os.getenv("AGENT_MAIL_BRIDGE_TRANSPORT_MAX_ATTEMPTS", "10")
+    ),
+    timeout_s: Annotated[float, typer.Option("--timeout-s", help="Peer API request timeout.")] = float(
+        os.getenv("AGENT_MAIL_BRIDGE_TRANSPORT_TIMEOUT_S", "10")
+    ),
+    once: Annotated[bool, typer.Option("--once", help="Run one flush and exit.")] = False,
+) -> None:
+    """Continuously push queued cross-system bridge deliveries to peers."""
+    interval = max(1.0, min(300.0, float(interval_s)))
+    while True:
+        started = time.monotonic()
+        try:
+            result = _call_local_agent_mail_tool(
+                api_url,
+                "flush_bridge_deliveries",
+                {
+                    "dest_host": dest_host,
+                    "limit": limit,
+                    "max_attempts": max_attempts,
+                    "timeout_s": timeout_s,
+                    "include_blocked": True,
+                },
+                timeout_s + 5.0,
+            )
+            if not isinstance(result, dict) or int(result.get("processed", 0) or 0) > 0:
+                console.print_json(data={"ts": datetime.now(timezone.utc).isoformat(), "result": result})
+        except Exception as exc:
+            console.print_json(data={"ts": datetime.now(timezone.utc).isoformat(), "error": str(exc)})
+        if once:
+            return
+        sleep_for = max(0.0, interval - (time.monotonic() - started))
+        time.sleep(sleep_for)
+
+
 @mail_app.command("status")
 def mail_status(
     project_path: Annotated[

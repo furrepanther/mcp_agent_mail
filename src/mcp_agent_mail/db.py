@@ -851,6 +851,12 @@ def _setup_fts(connection: Any) -> None:
         "ALTER TABLE projects ADD COLUMN archived_at DATETIME DEFAULT NULL",
         "ALTER TABLE agents ADD COLUMN registration_token VARCHAR(64) DEFAULT NULL",
         "ALTER TABLE messages ADD COLUMN topic VARCHAR(64) DEFAULT NULL",
+        "ALTER TABLE messages ADD COLUMN external_sender_host VARCHAR(64) DEFAULT NULL",
+        "ALTER TABLE messages ADD COLUMN external_sender_name VARCHAR(128) DEFAULT NULL",
+        "ALTER TABLE messages ADD COLUMN external_message_id VARCHAR(128) DEFAULT NULL",
+        "ALTER TABLE messages ADD COLUMN external_project_key VARCHAR(255) DEFAULT NULL",
+        "ALTER TABLE messages ADD COLUMN external_thread_id VARCHAR(128) DEFAULT NULL",
+        "ALTER TABLE messages ADD COLUMN bridge_dedupe_id VARCHAR(255) DEFAULT NULL",
     ]:
         with suppress(Exception):  # Column already exists — safe to ignore
             connection.exec_driver_sql(migration_sql)
@@ -860,8 +866,22 @@ def _setup_fts(connection: Any) -> None:
     for index_sql in [
         "CREATE INDEX IF NOT EXISTS ix_agents_registration_token ON agents (registration_token)",
         "CREATE INDEX IF NOT EXISTS idx_messages_project_topic ON messages (project_id, topic)",
+        "CREATE INDEX IF NOT EXISTS idx_messages_external_sender ON messages (external_sender_host, external_message_id)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_messages_bridge_dedupe_id "
+        "ON messages (bridge_dedupe_id) WHERE bridge_dedupe_id IS NOT NULL",
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_agent_mail_peer_host_key ON agent_mail_peers (host_key)",
+        "CREATE INDEX IF NOT EXISTS idx_agent_mail_peers_enabled ON agent_mail_peers (enabled)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_agent_mail_remote_identity "
+        "ON agent_mail_remote_identities (host_key, agent_name, remote_project_key)",
+        "CREATE INDEX IF NOT EXISTS idx_agent_mail_remote_identity_host "
+        "ON agent_mail_remote_identities (host_key, agent_name)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_agent_mail_bridge_id ON agent_mail_bridge_deliveries (bridge_id)",
+        "CREATE INDEX IF NOT EXISTS idx_agent_mail_bridge_status ON agent_mail_bridge_deliveries (status)",
+        "CREATE INDEX IF NOT EXISTS idx_agent_mail_bridge_dest ON agent_mail_bridge_deliveries (dest_host, dest_agent)",
+        "CREATE INDEX IF NOT EXISTS idx_agent_mail_bridge_local_message ON agent_mail_bridge_deliveries (local_message_id)",
     ]:
-        connection.exec_driver_sql(index_sql)
+        with suppress(Exception):
+            connection.exec_driver_sql(index_sql)
 
 
 def get_database_path(settings: Settings | None = None) -> Path | None:

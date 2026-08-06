@@ -170,18 +170,24 @@ if readiness_poll "${_HTTP_HOST}" "${_HTTP_PORT}" "/health/readiness" 3 0.5; the
     log_warn "Failed to ensure project"
   fi
 
-  # register_agent - DON'T pass a name, let server auto-generate adjective+noun name
+  # register_agent - prefer a stable setup identity so repeated installs re-use it.
+  _AGENT_HINT="RusticBrook"
+  _AGENT_HINT_ESCAPED=$(json_escape_string "${_AGENT_HINT}") || { log_err "Failed to escape agent name hint"; exit 1; }
   # Capture response to extract the generated name
-  _REGISTER_RESPONSE=$(curl -sS --connect-timeout 2 --max-time 5 --retry 0 -H "Content-Type: application/json" "${_AUTH_ARGS[@]}" \
-      -d "{\"jsonrpc\":\"2.0\",\"id\":\"2\",\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"project_key\":${_HUMAN_KEY_ESCAPED},\"program\":\"codex-cli\",\"model\":\"gpt-5-codex\",\"task_description\":\"setup\"}}}" \
+_REGISTER_RESPONSE=$(curl -sS --connect-timeout 2 --max-time 5 --retry 0 -H "Content-Type: application/json" "${_AUTH_ARGS[@]}" \
+      -d "{\"jsonrpc\":\"2.0\",\"id\":\"2\",\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"project_key\":${_HUMAN_KEY_ESCAPED},\"program\":\"codex-cli\",\"model\":\"gpt-5-codex\",\"name\":${_AGENT_HINT_ESCAPED},\"task_description\":\"setup\"}}}" \
       "${_URL}" 2>/dev/null || echo "")
 
   if [[ -n "${_REGISTER_RESPONSE}" ]]; then
     # Extract agent name from JSON response using jq or Python
     if command -v jq >/dev/null 2>&1; then
-      _AGENT=$(echo "${_REGISTER_RESPONSE}" | jq -r '.result.content[0].text // empty' 2>/dev/null | jq -r '.name // empty' 2>/dev/null || echo "")
+      _AGENT_PAYLOAD=$(echo "${_REGISTER_RESPONSE}" | jq -r '.result.content[0].text // empty' 2>/dev/null || echo "")
+      _AGENT=$(echo "${_AGENT_PAYLOAD}" | jq -r '.name // empty' 2>/dev/null || echo "")
+      _AGENT_REG_TOKEN=$(echo "${_AGENT_PAYLOAD}" | jq -r '.registration_token // empty' 2>/dev/null || echo "")
     else
-      _AGENT=$(echo "${_REGISTER_RESPONSE}" | uv run python -c 'import sys,json; r=json.load(sys.stdin); c=r.get("result",{}).get("content",[]); print(json.loads(c[0]["text"])["name"] if c else "")' 2>/dev/null || echo "")
+      eval "$(
+        echo "${_REGISTER_RESPONSE}" | uv run python -c 'import json,shlex,sys; r=json.load(sys.stdin); c=r.get("result",{}).get("content",[]); data=json.loads(c[0]["text"]) if c else {}; print(f"_AGENT={shlex.quote(data.get(\"name\",\"\"))}"); print(f"_AGENT_REG_TOKEN={shlex.quote(data.get(\"registration_token\",\"\"))}")' 2>/dev/null || true
+      )"
     fi
     if [[ -n "${_AGENT}" ]]; then
       log_ok "Registered agent: ${_AGENT}"
@@ -226,6 +232,7 @@ export AGENT_MAIL_PROJECT='${TARGET_DIR}'
 export AGENT_MAIL_AGENT='${_AGENT}'
 export AGENT_MAIL_URL='${_URL}'
 export AGENT_MAIL_TOKEN='${_TOKEN}'
+export AGENT_MAIL_REGISTRATION_TOKEN='${_AGENT_REG_TOKEN:-}'
 export AGENT_MAIL_INTERVAL='120'
 exec '${NOTIFY_HOOK}' "\$@"
 SH

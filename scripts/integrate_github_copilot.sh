@@ -225,7 +225,8 @@ else
   if [[ -n "${_TOKEN}" ]]; then _AUTH_ARGS+=("-H" "Authorization: Bearer ${_TOKEN}"); fi
 
   _HUMAN_KEY_ESCAPED=$(json_escape_string "${TARGET_DIR}") || { log_err "Failed to escape project path"; exit 1; }
-  _AGENT_ESCAPED=$(json_escape_string "${USER:-copilot}") || { log_err "Failed to escape agent name"; exit 1; }
+  _AGENT_HINT="BlueMountain"
+  _AGENT_HINT_ESCAPED=$(json_escape_string "${_AGENT_HINT}") || { log_err "Failed to escape agent name"; exit 1; }
 
   if curl -fsS --connect-timeout 1 --max-time 2 --retry 0 -H "Content-Type: application/json" "${_AUTH_ARGS[@]}" \
       -d "{\"jsonrpc\":\"2.0\",\"id\":\"1\",\"method\":\"tools/call\",\"params\":{\"name\":\"ensure_project\",\"arguments\":{\"human_key\":${_HUMAN_KEY_ESCAPED}}}}" \
@@ -236,7 +237,7 @@ else
   fi
 
   if curl -fsS --connect-timeout 1 --max-time 2 --retry 0 -H "Content-Type: application/json" "${_AUTH_ARGS[@]}" \
-      -d "{\"jsonrpc\":\"2.0\",\"id\":\"2\",\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"project_key\":${_HUMAN_KEY_ESCAPED},\"program\":\"github-copilot\",\"model\":\"gpt-4\",\"name\":${_AGENT_ESCAPED},\"task_description\":\"setup\"}}}" \
+      -d "{\"jsonrpc\":\"2.0\",\"id\":\"2\",\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"project_key\":${_HUMAN_KEY_ESCAPED},\"program\":\"github-copilot\",\"model\":\"gpt-4\",\"name\":${_AGENT_HINT_ESCAPED},\"task_description\":\"setup\"}}}" \
       "${_URL}" >/dev/null 2>&1; then
     log_ok "Registered agent on server"
   else

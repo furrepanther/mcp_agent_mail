@@ -171,6 +171,14 @@ _VALID_AGENT_NAMES: frozenset[str] = frozenset(
     f"{adj}{noun}".lower() for adj in ADJECTIVES for noun in NOUNS
 )
 
+# Reserved Agent Mail identities for the shared repair owner / child repair lane.
+_RESERVED_AGENT_NAMES: frozenset[str] = frozenset(
+    {
+        "mister-fixit",
+        "agent-repairman",
+    }
+)
+
 
 def slugify(value: str) -> str:
     """Normalize a human-readable value into a slug."""
@@ -207,12 +215,21 @@ def validate_agent_name_format(name: str) -> bool:
         return False
 
     # O(1) lookup using pre-built frozenset (vs O(n*m) iteration)
-    return name.lower() in _VALID_AGENT_NAMES
+    lowered = name.lower()
+    return lowered in _VALID_AGENT_NAMES or lowered in _RESERVED_AGENT_NAMES
 
 
 def sanitize_agent_name(value: str) -> Optional[str]:
     """Normalize user-provided agent name; return None if nothing remains."""
-    cleaned = _AGENT_NAME_RE.sub("", value.strip())
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+
+    lowered = cleaned.lower()
+    if lowered in _RESERVED_AGENT_NAMES:
+        return lowered
+
+    cleaned = _AGENT_NAME_RE.sub("", cleaned)
     if not cleaned:
         return None
     return cleaned[:128]

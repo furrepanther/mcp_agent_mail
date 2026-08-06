@@ -27,6 +27,7 @@ PROJECT="${AGENT_MAIL_PROJECT:-}"
 AGENT="${AGENT_MAIL_AGENT:-}"
 URL="${AGENT_MAIL_URL:-http://127.0.0.1:8765/api/}"
 TOKEN="${AGENT_MAIL_TOKEN:-}"
+REGISTRATION_TOKEN="${AGENT_MAIL_REGISTRATION_TOKEN:-}"
 INTERVAL="${AGENT_MAIL_INTERVAL:-120}"
 
 # Require project and agent
@@ -68,6 +69,7 @@ json_escape() {
 
 PROJECT_JSON=$(json_escape "${PROJECT}")
 AGENT_JSON=$(json_escape "${AGENT}")
+REGISTRATION_JSON=$(json_escape "${REGISTRATION_TOKEN}")
 
 # Build curl command with proper auth
 CURL_ARGS=(-s --max-time 3 -X POST "${URL}" -H "Content-Type: application/json")
@@ -77,7 +79,7 @@ fi
 
 # Fetch inbox via MCP
 RESPONSE=$(curl "${CURL_ARGS[@]}" \
-  -d "{\"jsonrpc\":\"2.0\",\"id\":\"1\",\"method\":\"tools/call\",\"params\":{\"name\":\"fetch_inbox\",\"arguments\":{\"project_key\":${PROJECT_JSON},\"agent_name\":${AGENT_JSON},\"limit\":10,\"include_bodies\":false}}}" 2>/dev/null || echo "")
+  -d "{\"jsonrpc\":\"2.0\",\"id\":\"1\",\"method\":\"tools/call\",\"params\":{\"name\":\"fetch_inbox\",\"arguments\":{\"project_key\":${PROJECT_JSON},\"agent_name\":${AGENT_JSON},\"registration_token\":${REGISTRATION_JSON},\"limit\":10,\"include_bodies\":false}}}" 2>/dev/null || echo "")
 
 # Check if we got a valid response with messages
 if [[ -z "${RESPONSE}" ]]; then
