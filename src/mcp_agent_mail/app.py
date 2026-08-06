@@ -3946,7 +3946,7 @@ async def _flush_bridge_deliveries_once(
         stmt = (
             select(AgentMailBridgeDelivery)
             .outerjoin(Message, Message.id == AgentMailBridgeDelivery.local_message_id)
-            .where(AgentMailBridgeDelivery.status.in_(list(wanted_statuses) + ["sending"]))
+            .where(AgentMailBridgeDelivery.status.in_([*list(wanted_statuses), "sending"]))
             .order_by(
                 case(
                     (func.lower(Message.importance).in_(["urgent", "high"]), 0),
@@ -8150,13 +8150,19 @@ def build_mcp_server() -> FastMCP:
                 select(AgentMailPeer).where(func.lower(AgentMailPeer.host_key) == source_host.lower())
             )
             peer = peer_result.scalars().first()
-            if peer is not None and peer.auth_token_hash:
-                if not peer_token or not hmac.compare_digest(_hash_bridge_token(peer_token), peer.auth_token_hash):
-                    raise ToolExecutionError(
-                        "AUTHENTICATION_REQUIRED",
-                        "Invalid or missing peer_token for bridge_receive_message.",
-                        recoverable=True,
-                    )
+            if (
+                peer is not None
+                and peer.auth_token_hash
+                and (
+                    not peer_token
+                    or not hmac.compare_digest(_hash_bridge_token(peer_token), peer.auth_token_hash)
+                )
+            ):
+                raise ToolExecutionError(
+                    "AUTHENTICATION_REQUIRED",
+                    "Invalid or missing peer_token for bridge_receive_message.",
+                    recoverable=True,
+                )
             dedupe_key = bridge_dedupe_id or (
                 f"{source_host}:{external_message_id}" if external_message_id else ""
             )

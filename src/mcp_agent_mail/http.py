@@ -29,8 +29,8 @@ from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoin
 from starlette.types import Receive, Scope, Send
 
 from .app import (
-    _expire_stale_file_reservations,
     _ensure_project,
+    _expire_stale_file_reservations,
     _tool_metrics_snapshot,
     build_mcp_server,
     get_project_sibling_data,
@@ -1115,13 +1115,15 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         # Both MCP transports own independent session managers.
         mcp_lifespan_app = cast(_FastAPILifespan, mcp_http_app)
         mcp_stateful_lifespan_app = cast(_FastAPILifespan, mcp_stateful_http_app)
-        async with mcp_lifespan_app.lifespan(mcp_http_app):
-            async with mcp_stateful_lifespan_app.lifespan(mcp_stateful_http_app):
-                await _startup()
-                try:
-                    yield
-                finally:
-                    await _shutdown()
+        async with (
+            mcp_lifespan_app.lifespan(mcp_http_app),
+            mcp_stateful_lifespan_app.lifespan(mcp_stateful_http_app),
+        ):
+            await _startup()
+            try:
+                yield
+            finally:
+                await _shutdown()
 
     # Now construct FastAPI with the composed lifespan so ASGI transports run it
     fastapi_app = FastAPI(lifespan=lifespan_context)
