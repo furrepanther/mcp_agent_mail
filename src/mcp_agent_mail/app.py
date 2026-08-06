@@ -1016,29 +1016,34 @@ def _truncate_text(value: str, *, limit: int = 2000) -> str:
     return f"{value[:limit]}...(+{len(value) - limit} chars)"
 
 
+_TOON_IDENT_TIMEOUT_SECONDS = 5.0
+
+
 @functools.lru_cache(maxsize=32)
 def _looks_like_toon_rust_encoder(exe: str) -> bool:
     """
     Best-effort guardrail to prevent accidentally using non-toon_rust encoders
     (e.g. the Node.js `toon` CLI or coreutils `tr`).
 
-    We rely on toon_rust's help/version banners, which are stable across installs.
+    Identification uses toon_rust's help/version banners, which are stable
+    across installs. A binary named ``toon`` is accepted only when its banner
+    identifies the Rust implementation; lookalike CLIs remain rejected.
     """
-    exe_basename = exe.split("/")[-1].split("\\")[-1].lower()
-    if exe_basename in {"toon", "toon.exe"}:
-        # Never accept (or invoke) the Node.js `toon` CLI as the encoder backend.
-        return False
-
     try:
         help_result = subprocess.run(
             [exe, "--help"],
             text=True,
+            encoding="utf-8",
+            errors="replace",
             capture_output=True,
             check=False,
+            timeout=_TOON_IDENT_TIMEOUT_SECONDS,
         )
     except FileNotFoundError:
         return False
     except OSError:
+        return False
+    except subprocess.TimeoutExpired:
         return False
 
     help_text = (help_result.stdout or "") + "\n" + (help_result.stderr or "")
@@ -1049,12 +1054,17 @@ def _looks_like_toon_rust_encoder(exe: str) -> bool:
         ver_result = subprocess.run(
             [exe, "--version"],
             text=True,
+            encoding="utf-8",
+            errors="replace",
             capture_output=True,
             check=False,
+            timeout=_TOON_IDENT_TIMEOUT_SECONDS,
         )
     except FileNotFoundError:
         return False
     except OSError:
+        return False
+    except subprocess.TimeoutExpired:
         return False
 
     ver_text = ((ver_result.stdout or "") + (ver_result.stderr or "")).strip().lower()
@@ -4380,6 +4390,75 @@ async def _collect_file_reservation_statuses(
     return statuses
 
 
+async def sweep_stale_agents(
+    *,
+    threshold_seconds: int,
+    project_id: Optional[int] = None,
+    exclude_agent_id: Optional[int] = None,
+    require_no_active_reservations: bool = False,
+    now: Optional[datetime] = None,
+) -> list[dict[str, Any]]:
+    """Retire agents inactive beyond a bounded threshold.
+
+    The sweep is conservative: it skips retired or recently active agents,
+    can scope to one project, can exclude the authenticated caller, and can
+    protect agents holding unexpired file reservations.
+    """
+    await ensure_schema()
+    threshold = max(60, int(threshold_seconds))
+    current = now or datetime.now(timezone.utc)
+    cutoff_naive = _naive_utc(current) - timedelta(seconds=threshold)
+    naive_now = _naive_utc(current)
+    retired: list[dict[str, Any]] = []
+
+    # Serialize reservation checks with retirement so a reservation cannot be
+    # created between the safety check and the state transition.
+    async with get_immediate_session() as session:
+        stmt = (
+            select(Agent, Project)
+            .join(Project, cast(Any, Agent.project_id) == Project.id)
+            .where(
+                cast(Any, Agent.retired_at).is_(None),
+                cast(Any, Agent.last_active_ts) < cutoff_naive,
+            )
+        )
+        if project_id is not None:
+            stmt = stmt.where(cast(Any, Agent.project_id) == project_id)
+        if exclude_agent_id is not None:
+            stmt = stmt.where(cast(Any, Agent.id) != exclude_agent_id)
+        if require_no_active_reservations:
+            active_reservation = (
+                select(FileReservation.id)
+                .where(
+                    cast(Any, FileReservation.agent_id) == Agent.id,
+                    cast(Any, FileReservation.released_ts).is_(None),
+                    cast(Any, FileReservation.expires_ts) > naive_now,
+                )
+                .correlate(Agent)
+            )
+            stmt = stmt.where(~exists(active_reservation))
+        stmt = stmt.order_by(cast(Any, Project.id), cast(Any, Agent.id))
+        result = await session.execute(stmt)
+        candidates: list[tuple[Agent, Project]] = [
+            cast(tuple[Agent, Project], row) for row in result.all()
+        ]
+        for agent, project in candidates:
+            agent.retired_at = naive_now
+            session.add(agent)
+            retired.append(
+                {
+                    "agent_id": agent.id,
+                    "agent_name": agent.name,
+                    "project_id": project.id,
+                    "project_key": project.human_key,
+                    "last_active_ts": _iso(agent.last_active_ts),
+                }
+            )
+        if retired:
+            await session.commit()
+    return retired
+
+
 async def _expire_stale_file_reservations(
     project_id: int,
     *,
@@ -4631,6 +4710,7 @@ async def _list_inbox(
     include_bodies: bool,
     since_ts: Optional[str],
     topic: Optional[str] = None,
+    unread_only: bool = False,
 ) -> list[dict[str, Any]]:
     if project.id is None or agent.id is None:
         raise ValueError("Project and agent must have ids before listing inbox.")
@@ -4656,6 +4736,10 @@ async def _list_inbox(
                 stmt = stmt.where(Message.created_ts > _naive_utc(since_dt))
         if topic:
             stmt = stmt.where(cast(Any, func.lower(Message.topic)) == topic.lower())
+        if unread_only:
+            # MessageRecipient is already scoped to this agent, so a NULL
+            # read timestamp is the per-recipient unread definition.
+            stmt = stmt.where(cast(Any, MessageRecipient.read_ts).is_(None))
         result = await session.execute(stmt)
         rows = result.all()
     messages: list[dict[str, Any]] = []
@@ -5926,6 +6010,61 @@ def build_mcp_server() -> FastMCP:
             "status": "retired",
             "agent_name": agent_name,
             "project_key": project_key,
+        }
+
+    @mcp.tool(
+        name="sweep_stale_agents",
+        description=(
+            "Retire abandoned agents in the caller's project using a conservative inactivity threshold. "
+            "The caller is never retired, the threshold has a 60-second floor, and active file reservations "
+            "block retirement by default."
+        ),
+    )
+    @_instrument_tool(
+        "sweep_stale_agents",
+        cluster=CLUSTER_IDENTITY,
+        capabilities={"identity", "file_reservations"},
+        agent_arg="agent_name",
+        project_arg="project_key",
+    )
+    async def sweep_stale_agents_tool(
+        ctx: Context,
+        project_key: str,
+        agent_name: str,
+        threshold_seconds: int = 86400,
+        require_no_active_reservations: bool = True,
+        registration_token: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Retire stale project agents without target-token custody."""
+        project = await _get_project_by_identifier(project_key)
+        actor = await _authenticate_agent(
+            ctx,
+            project,
+            agent_name,
+            registration_token,
+            token_param="registration_token",
+            action="sweep_stale_agents",
+        )
+        if project.id is None or actor.id is None:
+            raise ValueError("Project and caller must have ids before sweeping stale agents.")
+
+        effective_threshold = max(60, int(threshold_seconds))
+        retired = await sweep_stale_agents(
+            threshold_seconds=effective_threshold,
+            project_id=project.id,
+            exclude_agent_id=actor.id,
+            require_no_active_reservations=require_no_active_reservations,
+        )
+        retired_names = [entry["agent_name"] for entry in retired]
+        await ctx.info(f"Retired {len(retired_names)} stale agent(s) in project '{project.human_key}'.")
+        return {
+            "project_key": project.human_key,
+            "requested_by": actor.name,
+            "threshold_seconds": effective_threshold,
+            "require_no_active_reservations": require_no_active_reservations,
+            "retired": retired_names,
+            "retired_agents": retired,
+            "count": len(retired_names),
         }
 
     @mcp.tool(
@@ -8833,6 +8972,7 @@ def build_mcp_server() -> FastMCP:
         include_bodies: bool = False,
         since_ts: Optional[str] = None,
         topic: Optional[str] = None,
+        unread_only: bool = False,
         registration_token: Optional[str] = None,
         format: Optional[str] = None,
     ) -> list[dict[str, Any]]:
@@ -8846,6 +8986,7 @@ def build_mcp_server() -> FastMCP:
         - `limit`: max number of messages (default 20)
         - `include_bodies`: include full Markdown bodies in the payloads
         - `topic`: filter to messages with this topic tag
+        - `unread_only`: only messages this recipient has not marked read
 
         Usage patterns
         --------------
@@ -8902,11 +9043,23 @@ def build_mcp_server() -> FastMCP:
                 token_param="registration_token",
                 action="fetch_inbox",
             )
-            items = await _list_inbox(project, agent, limit, urgent_only, include_bodies, since_ts, topic=topic)
+            items = await _list_inbox(
+                project,
+                agent,
+                limit,
+                urgent_only,
+                include_bodies,
+                since_ts,
+                topic=topic,
+                unread_only=unread_only,
+            )
             if settings.notifications.enabled:
                 with suppress(Exception):
                     await clear_notification_signal(settings, project.slug, agent.name)
-            await ctx.info(f"Fetched {len(items)} messages for '{agent.name}'. urgent_only={urgent_only}")
+            await ctx.info(
+                f"Fetched {len(items)} messages for '{agent.name}'. "
+                f"urgent_only={urgent_only} unread_only={unread_only}"
+            )
             return items
         except Exception as exc:
             _rich_error_panel("fetch_inbox", {"error": str(exc)})
@@ -8927,6 +9080,7 @@ def build_mcp_server() -> FastMCP:
         include_bodies: bool = True,
         since_ts: Optional[str] = None,
         agent_name: Optional[str] = None,
+        unread_only: bool = False,
         registration_token: Optional[str] = None,
         format: Optional[str] = None,
     ) -> list[dict[str, Any]]:
@@ -8981,7 +9135,6 @@ def build_mcp_server() -> FastMCP:
                 .where(
                     cast(Any, Message.project_id) == project.id,
                     cast(Any, func.lower(Message.topic)) == topic_name.strip().lower(),
-                    _message_visible_to_agent_clause(viewer.id or 0),
                 )
                 .order_by(desc(Message.created_ts))
                 .limit(limit)
@@ -8990,6 +9143,17 @@ def build_mcp_server() -> FastMCP:
                 since_dt = _parse_iso(since_ts)
                 if since_dt:
                     stmt = stmt.where(Message.created_ts > _naive_utc(since_dt))
+            if unread_only:
+                viewer_recipient = aliased(MessageRecipient)
+                stmt = stmt.join(
+                    viewer_recipient,
+                    cast(Any, viewer_recipient.message_id) == Message.id,
+                ).where(
+                    cast(Any, viewer_recipient.agent_id) == (viewer.id or 0),
+                    cast(Any, viewer_recipient.read_ts).is_(None),
+                )
+            else:
+                stmt = stmt.where(_message_visible_to_agent_clause(viewer.id or 0))
             result = await session.execute(stmt)
             rows = result.all()
         messages: list[dict[str, Any]] = []
@@ -8997,7 +9161,10 @@ def build_mcp_server() -> FastMCP:
             payload = _message_to_dict(message, include_body=include_bodies)
             payload["from"] = sender_name
             messages.append(payload)
-        await ctx.info(f"Fetched {len(messages)} messages with topic '{topic_name}'.")
+        await ctx.info(
+            f"Fetched {len(messages)} messages with topic '{topic_name}'. "
+            f"unread_only={unread_only}"
+        )
         return messages
 
     @mcp.tool(name="mark_message_read")

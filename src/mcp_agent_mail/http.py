@@ -652,6 +652,15 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         json_response=True,
     )
 
+    # Keep a stateful MCP transport for spec-compliant clients that retain an
+    # Mcp-Session-Id. The configured base and /api remain stateless for
+    # existing one-shot clients.
+    mcp_stateful_http_app = cast(_FastMCPHttpApp, server).http_app(
+        path="/",
+        stateless_http=False,
+        json_response=True,
+    )
+
     # no-op wrapper removed; using explicit stateless adapter below
 
     # Background workers lifecycle
@@ -1103,14 +1112,16 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan_context(app: FastAPI):
-        # Ensure the mounted MCP app initializes its internal task group
+        # Both MCP transports own independent session managers.
         mcp_lifespan_app = cast(_FastAPILifespan, mcp_http_app)
+        mcp_stateful_lifespan_app = cast(_FastAPILifespan, mcp_stateful_http_app)
         async with mcp_lifespan_app.lifespan(mcp_http_app):
-            await _startup()
-            try:
-                yield
-            finally:
-                await _shutdown()
+            async with mcp_stateful_lifespan_app.lifespan(mcp_stateful_http_app):
+                await _startup()
+                try:
+                    yield
+                finally:
+                    await _shutdown()
 
     # Now construct FastAPI with the composed lifespan so ASGI transports run it
     fastapi_app = FastAPI(lifespan=lifespan_context)
@@ -1329,6 +1340,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
     base_no_slash = mount_base.rstrip("/") or "/"
     base_with_slash = base_no_slash if base_no_slash == "/" else base_no_slash + "/"
     stateless_app = _HeaderFixupMCPApp(mcp_http_app)
+    stateful_app = _HeaderFixupMCPApp(mcp_stateful_http_app)
 
     mount_paths = [base_no_slash, base_with_slash]
     for compat_base in ("/api", "/mcp"):
@@ -1359,9 +1371,18 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
     for path in sorted(oauth_metadata_paths):
         _register_oauth_metadata_disabled(path)
 
+    def _app_for_mount(mount_path: str) -> _HeaderFixupMCPApp:
+        normalized = mount_path.rstrip("/") or "/"
+        # /mcp is the stateful compatibility endpoint unless the operator
+        # explicitly configured the service base as /mcp (legacy stateless
+        # semantics are preserved for that explicit setting).
+        if normalized == "/mcp" and base_no_slash != "/mcp":
+            return stateful_app
+        return stateless_app
+
     for mount_path in mount_paths:
         with contextlib.suppress(Exception):
-            fastapi_app.mount(mount_path, stateless_app)
+            fastapi_app.mount(mount_path, _app_for_mount(mount_path))
 
     # Expose composed lifespan via router
     fastapi_app.router.lifespan_context = lifespan_context
@@ -1370,7 +1391,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
     def _register_base_passthrough(base_path_no_slash: str, base_path_with_slash: str) -> None:
         @fastapi_app.post(base_path_no_slash)
         async def _base_passthrough(request: Request) -> JSONResponse:
-            # Re-dispatch to mounted stateless app by calling it directly
+            # Re-dispatch to the matching transport by calling it directly.
             response_body: dict[str, Any] = {}
             status_code = 200
             headers: dict[str, str] = {}
@@ -1401,7 +1422,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 if not has_auth and settings.http.bearer_token:
                     scope_headers.append((b"authorization", f"Bearer {settings.http.bearer_token}".encode("latin1")))
                 scope["headers"] = scope_headers
-            await stateless_app(
+            await _app_for_mount(base_path_no_slash)(
                 {**scope, "path": "/"},  # MCP app expects requests at its root
                 request.receive,
                 _send,
