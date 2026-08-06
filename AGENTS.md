@@ -1,3 +1,13 @@
+## FIRST: Refresh From Origin, Preserve Local Work
+
+For every repository task, make refreshing from `origin` the first repository action. This keeps active local code current without losing local work.
+
+1. Run `git fetch origin --prune --tags` before other repository actions; if no usable `origin` exists, record that blocker before continuing.
+2. Inspect `git status`, `git fsck --full`, and divergence from the tracked branch.
+3. If `origin` has commits we do not have, preserve every local modification first in a recoverable commit or patch, refresh the clean base, and merge the preserved local changes back.
+4. Never discard, overwrite, or silently reset local changes. Resolve conflicts deliberately while retaining local behavior, then run affected tests and review the resulting diff.
+5. Record resulting commit IDs and verification evidence before continuing with normal work.
+
 RULE NUMBER 1 (NEVER EVER EVER FORGET THIS RULE!!!): YOU ARE NEVER ALLOWED TO DELETE A FILE WITHOUT EXPRESS PERMISSION FROM ME OR A DIRECT COMMAND FROM ME. EVEN A NEW FILE THAT YOU YOURSELF CREATED, SUCH AS A TEST CODE FILE. YOU HAVE A HORRIBLE TRACK RECORD OF DELETING CRITICALLY IMPORTANT FILES OR OTHERWISE THROWING AWAY TONS OF EXPENSIVE WORK THAT I THEN NEED TO PAY TO REPRODUCE. AS A RESULT, YOU HAVE PERMANENTLY LOST ANY AND ALL RIGHTS TO DETERMINE THAT A FILE OR FOLDER SHOULD BE DELETED. YOU MUST **ALWAYS** ASK AND *RECEIVE* CLEAR, WRITTEN PERMISSION FROM ME BEFORE EVER EVEN THINKING OF DELETING A FILE OR FOLDER OF ANY KIND!!!
 
 ### IRREVERSIBLE GIT & FILESYSTEM ACTIONS — DO-NOT-EVER BREAK GLASS
