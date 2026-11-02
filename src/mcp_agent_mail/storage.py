@@ -32,7 +32,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any, AsyncIterator, Iterable, Sequence, TypeVar, cast
+from typing import Any, AsyncGenerator, Iterable, Sequence, TypeVar, cast
 
 from filelock import SoftFileLock, Timeout
 from git import Actor, Repo
@@ -730,8 +730,17 @@ class AsyncFileLock:
             _ACTIVE_LOCK_INSTANCES[id(self)] = self
 
     def __del__(self) -> None:
-        with _LOCK_INSTANCES_GUARD:
-            _ACTIVE_LOCK_INSTANCES.pop(id(self), None)
+        # Module globals can already be cleared during interpreter teardown.
+        # Finalizers must never turn normal shutdown into unhandled stderr noise.
+        try:
+            registry = globals().get("_ACTIVE_LOCK_INSTANCES")
+            guard = globals().get("_LOCK_INSTANCES_GUARD")
+            if registry is None or guard is None:
+                return
+            with guard:
+                registry.pop(id(self), None)
+        except (AttributeError, TypeError):
+            return
 
     def _force_close_fd(self) -> bool:
         """Force-close the underlying SoftFileLock file descriptor if still open.
@@ -1098,7 +1107,7 @@ class AsyncFileLock:
 
 
 @asynccontextmanager
-async def archive_write_lock(archive: ProjectArchive, *, timeout_seconds: float = 60.0) -> AsyncIterator[None]:
+async def archive_write_lock(archive: ProjectArchive, *, timeout_seconds: float = 60.0) -> AsyncGenerator[None, None]:
     """Context manager for safely mutating archive surfaces."""
     lock = AsyncFileLock(archive.lock_path, timeout_seconds=timeout_seconds)
     await lock.__aenter__()
@@ -2117,8 +2126,7 @@ async def heal_archive_locks(settings: Settings) -> dict[str, Any]:
         return summary
 
     for lock_path_item in sorted(root.rglob("*.lock"), key=str):
-        # rglob returns Path objects at runtime; cast for type checker
-        lock_path = cast(Path, lock_path_item)
+        lock_path = lock_path_item
         summary["locks_scanned"] += 1
         try:
             lock = AsyncFileLock(lock_path, timeout_seconds=0.0, stale_timeout_seconds=0.0)
@@ -2129,8 +2137,7 @@ async def heal_archive_locks(settings: Settings) -> dict[str, Any]:
             continue
 
     for metadata_path_item in sorted(root.rglob("*.lock.owner.json"), key=str):
-        # rglob returns Path objects at runtime; cast for type checker
-        metadata_path = cast(Path, metadata_path_item)
+        metadata_path = metadata_path_item
         name = metadata_path.name
         if not name.endswith(".owner.json"):
             continue
@@ -2579,7 +2586,9 @@ async def get_file_content(
             try:
                 return str(stream.read().decode("utf-8", errors="replace"))
             finally:
-                stream.close()
+                close_stream = getattr(stream, "close", None)
+                if callable(close_stream):
+                    close_stream()
         except KeyError:
             return None
 

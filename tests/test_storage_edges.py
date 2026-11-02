@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 from fastmcp import Client
 
+from mcp_agent_mail import storage
 from mcp_agent_mail.app import build_mcp_server
 from mcp_agent_mail.config import get_settings
 from mcp_agent_mail.storage import AsyncFileLock
@@ -123,3 +124,12 @@ async def test_async_file_lock_recovers_stale(tmp_path, monkeypatch):
     # Metadata should be cleaned up after release
     assert not metadata_path.exists()
     assert not lock_path.exists()
+
+
+def test_async_file_lock_finalizer_tolerates_module_teardown(tmp_path, monkeypatch):
+    """Interpreter teardown must not emit a finalizer exception."""
+    lock = AsyncFileLock(tmp_path / ".archive.lock")
+    monkeypatch.setattr(storage, "_ACTIVE_LOCK_INSTANCES", None)
+    monkeypatch.setattr(storage, "_LOCK_INSTANCES_GUARD", None)
+
+    lock.__del__()
