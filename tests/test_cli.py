@@ -1,4 +1,6 @@
 import asyncio
+import tomllib
+from pathlib import Path
 from typing import Any
 
 from typer.testing import CliRunner
@@ -6,6 +8,12 @@ from typer.testing import CliRunner
 from mcp_agent_mail.cli import app
 from mcp_agent_mail.db import ensure_schema, get_session
 from mcp_agent_mail.models import Agent, Project
+
+
+def test_pyproject_exposes_mcp_agent_mail_entrypoint():
+    project_file = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    project = tomllib.loads(project_file.read_text(encoding="utf-8"))
+    assert project["project"]["scripts"]["mcp-agent-mail"] == "mcp_agent_mail.cli:app"
 
 
 def test_cli_lint(monkeypatch):
@@ -38,17 +46,19 @@ def test_cli_serve_http_uses_settings(isolated_env, monkeypatch):
     runner = CliRunner()
     call_args: dict[str, Any] = {}
 
-    def fake_uvicorn_run(app, host, port, log_level="info"):
+    def fake_uvicorn_run(app, host, port, log_level="info", access_log=True):
         call_args["app"] = app
         call_args["host"] = host
         call_args["port"] = port
         call_args["log_level"] = log_level
+        call_args["access_log"] = access_log
 
     monkeypatch.setattr("uvicorn.run", fake_uvicorn_run)
     result = runner.invoke(app, ["serve-http"])
     assert result.exit_code == 0
     assert call_args["host"] == "127.0.0.1"
     assert call_args["port"] == 8765
+    assert call_args["access_log"] is False
 
 
 def test_cli_serve_stdio(isolated_env, monkeypatch):
