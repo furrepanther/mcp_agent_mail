@@ -23,7 +23,7 @@ import logging
 import random
 import re
 import time
-from collections.abc import AsyncIterator, Callable, Iterator
+from collections.abc import AsyncGenerator, Callable, Generator
 from contextlib import asynccontextmanager, contextmanager, suppress
 from dataclasses import dataclass, field
 from enum import Enum
@@ -185,7 +185,7 @@ def stop_query_tracking(token: contextvars.Token) -> None:
 
 
 @contextmanager
-def track_queries(*, slow_ms: float | None = None) -> Iterator[QueryTracker]:
+def track_queries(*, slow_ms: float | None = None) -> Generator[QueryTracker, None, None]:
     tracker, token = start_query_tracking(slow_ms=slow_ms)
     try:
         yield tracker
@@ -421,7 +421,7 @@ def _build_engine(settings: DatabaseSettings) -> AsyncEngine:
             - wal_autocheckpoint=1000: Checkpoint every ~4MB to prevent WAL bloat
             - cache_size=-32768: 32MB page cache (negative = KB, positive = pages)
             - temp_store=MEMORY: Temp tables in memory for faster operations
-            - mmap_size=268435456: 256MB memory-mapped I/O for faster reads
+            - mmap_size=0: keep reads coherent across long-lived processes
             """
             cursor = dbapi_conn.cursor()
             try:
@@ -450,9 +450,12 @@ def _build_engine(settings: DatabaseSettings) -> AsyncEngine:
                 # Keep temp tables in memory for faster operations
                 cursor.execute("PRAGMA temp_store=MEMORY")
 
-                # Enable memory-mapped I/O for faster reads (256MB limit)
-                # This is particularly helpful for read-heavy workloads
-                cursor.execute("PRAGMA mmap_size=268435456")
+                # Keep SQLite's optional per-connection database mapping off.
+                # Agent Mail coordinates multiple long-lived processes, and its
+                # production runtime can place the database on a mounted volume.
+                # Correct cross-process freshness is more important here than
+                # avoiding an xRead copy for an inbox query.
+                cursor.execute("PRAGMA mmap_size=0")
 
             finally:
                 cursor.close()
@@ -551,7 +554,7 @@ def get_session_factory() -> async_sessionmaker[AsyncSession]:
 
 
 @asynccontextmanager
-async def get_session(*, check_circuit_breaker: bool = False) -> AsyncIterator[AsyncSession]:
+async def get_session(*, check_circuit_breaker: bool = False) -> AsyncGenerator[AsyncSession, None]:
     """Provide an async database session with guaranteed cleanup.
 
     This context manager ensures the session is always closed, even under task
@@ -593,7 +596,7 @@ async def get_session(*, check_circuit_breaker: bool = False) -> AsyncIterator[A
 
 
 @asynccontextmanager
-async def get_immediate_session(*, check_circuit_breaker: bool = False) -> AsyncIterator[AsyncSession]:
+async def get_immediate_session(*, check_circuit_breaker: bool = False) -> AsyncGenerator[AsyncSession, None]:
     """Provide an async database session that begins with ``BEGIN IMMEDIATE``.
 
     This forces SQLite to acquire a *reserved lock* at the start of the
