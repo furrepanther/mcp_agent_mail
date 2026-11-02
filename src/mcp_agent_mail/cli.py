@@ -16,7 +16,6 @@ import tempfile
 import threading
 import time
 import warnings
-import webbrowser
 from contextlib import nullcontext, suppress
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
@@ -1655,7 +1654,10 @@ def share_preview(
     port: Annotated[int, typer.Option("--port", help="Port for the preview server.")] = 9000,
     open_browser: Annotated[
         bool,
-        typer.Option("--open-browser/--no-open-browser", help="Automatically open the bundle in a browser."),
+        typer.Option(
+            "--open-browser/--no-open-browser",
+            help="Retained for compatibility; automatic browser launch is disabled.",
+        ),
     ] = False,
 ) -> None:
     """Serve a static export bundle locally for inspection."""
@@ -1678,8 +1680,10 @@ def share_preview(
     console.print("[dim]Commands: press 'r' to force refresh, 'd' to deploy now, 'q' to stop.[/]")
 
     if open_browser:
-        with suppress(Exception):
-            webbrowser.open(f"http://{actual_host}:{actual_port}/viewer/")
+        console.print(
+            "[yellow]Automatic browser launch is disabled; open "
+            f"http://{actual_host}:{actual_port}/viewer/ manually if needed.[/]"
+        )
 
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
