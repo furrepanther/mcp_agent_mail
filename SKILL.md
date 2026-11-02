@@ -23,17 +23,44 @@ Agent Mail solves this with:
 
 ## Starting the Server
 
+For a fresh standalone installation, use the project directory that was
+installed on the host; do not assume `~/projects/mcp_agent_mail` exists.
+
 ```bash
 # Quickest way (alias added during install)
 am
 
-# Or manually
-cd ~/projects/mcp_agent_mail
+# Or from a checked-out repository
 ./scripts/run_server_with_token.sh
 ```
 
-Default: `http://127.0.0.1:8765`
-Web UI for humans: `http://127.0.0.1:8765/mail`
+The upstream configuration default is `http://127.0.0.1:8765`. A managed
+deployment may intentionally use a different loopback port. Read its active
+configuration or identity environment and probe `/health/readiness`; never
+hard-code a port or restart a running service merely because the upstream
+default is unavailable.
+
+Web UI for humans: `http://127.0.0.1:<configured-port>/mail`
+
+## Operational Safety
+
+Agent Mail is the authoritative record for work orders, revisions, decisions,
+and completion. A notification transport, delivery state, message read state,
+or acknowledgment is not proof that a recipient accepted work. Retrieve the
+authenticated original message, validate its target and scope, and preserve the
+thread when replying.
+
+- Approve a contact request only with `respond_contact(..., accept=true)` from
+  the receiving identity and preserve its `approved` result. Contact links are
+  directed; `list_contacts` may show only links initiated by its caller, so an
+  empty receiving-side list is not proof that approval failed.
+- Keep registration and bearer tokens out of URLs, command lines, diagnostics,
+  and message bodies. Use a managed identity environment or a maintained
+  wrapper, and redact nonempty secret values before displaying errors.
+- Do not repeatedly reply to timeout/polling notices. Reuse a thread, report
+  one concrete blocker or next action, then use bounded polling.
+- When another notification transport is present, treat it as an advisory hint
+  and fetch Agent Mail before acting.
 
 ## Core Concepts
 
@@ -394,7 +421,9 @@ uv run python -m mcp_agent_mail.cli config set-port 9000
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `STORAGE_ROOT` | `~/.mcp_agent_mail_git_mailbox_repo` | Root for repos and SQLite DB |
+| `HTTP_HOST` | `127.0.0.1` | Bind address for the HTTP transport |
 | `HTTP_PORT` | `8765` | Server port |
+| `HTTP_PATH` | configured API path | MCP HTTP mount path; discover it from the active service configuration |
 | `HTTP_BEARER_TOKEN` | — | Static bearer token for auth |
 | `LLM_ENABLED` | `true` | Enable LLM for summaries/discovery |
 | `CONTACT_ENFORCEMENT_ENABLED` | `true` | Enforce contact policy |
