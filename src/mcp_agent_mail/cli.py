@@ -46,7 +46,7 @@ from sqlalchemy.sql import ColumnElement
 
 from .app import _sanitize_fts_query, build_mcp_server
 from .config import get_settings
-from .db import ensure_schema, get_session, reset_database_state
+from .db import ensure_schema, get_immediate_session, get_session, reset_database_state
 from .guard import install_guard as install_guard_script, uninstall_guard as uninstall_guard_script
 from .http import build_http_app
 from .models import (
@@ -4013,6 +4013,36 @@ def projects_adopt(
         console.print("[red]Refusing to adopt: projects do not appear to belong to the same repository.[/]")
         return
 
+    async def _assert_no_attested_messages(session: Any) -> None:
+        if src.id is None:
+            raise typer.BadParameter("Source project must be persisted (id not null).")
+        attested_message = (
+            await session.execute(
+                select(Message.id)
+                .where(
+                    cast(ColumnElement[bool], Message.project_id == src.id),
+                    cast(ColumnElement[bool], Message.attestation_version >= 1),
+                )
+                .limit(1)
+            )
+        ).scalars().first()
+        if attested_message is not None:
+            raise typer.BadParameter(
+                "Refusing to adopt a project containing attested messages; "
+                "its immutable project provenance cannot be re-keyed. "
+                "No archive or database changes were made."
+            )
+
+    async def _preflight_attested_messages() -> None:
+        await ensure_schema()
+        async with get_session() as session:
+            await _assert_no_attested_messages(session)
+
+    # The plan below opens archive roots.  An apply must reject immutable
+    # messages before that preparation can create or move any archive state.
+    if not dry_run:
+        _run_async(_preflight_attested_messages())
+
     # Describe filesystem moves (archive layout)
     settings = get_settings()
     from .storage import ensure_archive as _ensure_archive
@@ -4032,44 +4062,50 @@ def projects_adopt(
     async def _apply() -> None:
         if src.id is None or dst.id is None:
             raise typer.BadParameter("Projects must be persisted (id not null).")
-        # Detect agent name conflicts
         await ensure_schema()
-        async with get_session() as session:
+        # Hold SQLite's writer lock through the archive move and project-id
+        # re-key so an attested message cannot arrive between preflight and
+        # the immutable-row update.
+        async with get_immediate_session() as session:
+            from sqlalchemy import update as _update  # local import keeps CLI imports stable
             src_agents = [row[0] for row in (await session.execute(select(Agent.name).where(cast(ColumnElement[bool], Agent.project_id == src.id)))).all()]
             dst_agents = [row[0] for row in (await session.execute(select(Agent.name).where(cast(ColumnElement[bool], Agent.project_id == dst.id)))).all()]
             dup = sorted(set(src_agents).intersection(set(dst_agents)))
             if dup:
                 raise typer.BadParameter(f"Agent name conflicts in target project: {', '.join(dup)}")
-        # Move Git artifacts
-        settings = get_settings()
-        # local import to minimize top-level churn and keep ordering stable
-        from .storage import AsyncFileLock as _AsyncFileLock, ensure_archive as _ensure_archive
-        src_archive = _run_async(_ensure_archive(settings, src.slug))
-        dst_archive = _run_async(_ensure_archive(settings, dst.slug))
-        moved_relpaths: list[str] = []
-        for path_item in sorted(src_archive.root.rglob("*"), key=str):
-            # rglob returns Path objects at runtime; cast for type checker
-            path = cast(Path, path_item)
-            if not path.is_file():
-                continue
-            if path.name.endswith(".lock") or path.name.endswith(".lock.owner.json"):
-                continue
-            rel_from_root = path.relative_to(src_archive.root)
-            dest_path = dst_archive.root / rel_from_root
-            await asyncio.to_thread(dest_path.parent.mkdir, parents=True, exist_ok=True)
-            if dest_path.exists():
-                continue
-            await asyncio.to_thread(path.replace, dest_path)
-            moved_relpaths.append(dest_path.relative_to(dst_archive.repo_root).as_posix())
-        from .storage import _commit as _archive_commit
-        async with _AsyncFileLock(dst_archive.lock_path):
-            await _archive_commit(dst_archive.repo, settings, f"adopt: move {src.slug} into {dst.slug}", moved_relpaths)
-        # Re-key database rows (agents, messages, file_reservations)
-        async with get_session() as session:
-            from sqlalchemy import update as _update  # local import to avoid top-of-file churn
+            # Recheck while BEGIN IMMEDIATE holds SQLite's writer lock.  The
+            # same uncommitted transaction spans archive work and re-key, so
+            # no attested insert can race this immutable provenance update.
+            await _assert_no_attested_messages(session)
+            # Move Git artifacts while the immediate transaction retains the
+            # writer lock. An exception rolls back all later database re-key
+            # work and releases the lock before the command reports failure.
+            settings = get_settings()
+            from .storage import AsyncFileLock as _AsyncFileLock, ensure_archive as _ensure_archive
+            src_archive = await _ensure_archive(settings, src.slug)
+            dst_archive = await _ensure_archive(settings, dst.slug)
+            moved_relpaths: list[str] = []
+            for path_item in sorted(src_archive.root.rglob("*"), key=str):
+                path = cast(Path, path_item)
+                if not path.is_file():
+                    continue
+                if path.name.endswith(".lock") or path.name.endswith(".lock.owner.json"):
+                    continue
+                rel_from_root = path.relative_to(src_archive.root)
+                dest_path = dst_archive.root / rel_from_root
+                await asyncio.to_thread(dest_path.parent.mkdir, parents=True, exist_ok=True)
+                if dest_path.exists():
+                    continue
+                await asyncio.to_thread(path.replace, dest_path)
+                moved_relpaths.append(dest_path.relative_to(dst_archive.repo_root).as_posix())
+            from .storage import _commit as _archive_commit
+            async with _AsyncFileLock(dst_archive.lock_path):
+                await _archive_commit(dst_archive.repo, settings, f"adopt: move {src.slug} into {dst.slug}", moved_relpaths)
+            # Re-key database rows under the same immediate transaction.
             await session.execute(_update(Agent).where(cast(ColumnElement[bool], Agent.project_id == src.id)).values(project_id=dst.id))
             await session.execute(_update(Message).where(cast(ColumnElement[bool], Message.project_id == src.id)).values(project_id=dst.id))
             await session.execute(_update(FileReservation).where(cast(ColumnElement[bool], FileReservation.project_id == src.id)).values(project_id=dst.id))
+            await session.flush()
             await session.commit()
         # Write aliases.json under target
         aliases_path = dst_archive.root / "aliases.json"

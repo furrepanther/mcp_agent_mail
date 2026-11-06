@@ -1790,6 +1790,298 @@ def _agent_to_dict(agent: Agent) -> dict[str, Any]:
     return d
 
 
+_ATTESTATION_VERSION = 1
+_BODY_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _body_sha256(body_md: str) -> str:
+    """Return the canonical digest for the exact UTF-8 message body."""
+    return hashlib.sha256(body_md.encode("utf-8")).hexdigest()
+
+
+def _normalize_supersedes_message_id(value: object | None) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    if not normalized:
+        return None
+    if len(normalized) > 128:
+        raise ValueError("supersedes_message_id must be at most 128 characters.")
+    return normalized
+
+
+def _bridge_dedupe_scope(
+    project_id: int,
+    source_host: str,
+    source_agent: str,
+    source_project_key: str,
+) -> str:
+    """Bind an inbound dedupe token to its receiving project and provenance."""
+    canonical = "\x1f".join(
+        (
+            str(project_id),
+            source_host.strip().casefold(),
+            source_agent.strip().casefold(),
+            source_project_key.strip(),
+        )
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _bridge_revision_scope(
+    project_id: int,
+    source_host: str,
+    source_agent: str,
+    source_project_key: str,
+    supersedes_message_id: str,
+) -> str:
+    """Bind a remote revision parent to one receiving project and provenance."""
+    canonical = "\x1f".join(
+        (
+            str(project_id),
+            source_host.strip().casefold(),
+            source_agent.strip().casefold(),
+            source_project_key.strip(),
+            supersedes_message_id,
+        )
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _same_bridge_attestation(
+    message: Message,
+    *,
+    attestation_version: int,
+    body_sha256: str | None,
+    revision: int,
+    supersedes_message_id: str | None,
+) -> bool:
+    return (
+        int(getattr(message, "attestation_version", 0) or 0) == attestation_version
+        and getattr(message, "body_sha256", None) == body_sha256
+        and int(getattr(message, "revision", 0) or 0) == revision
+        and getattr(message, "supersedes_message_id", None) == supersedes_message_id
+    )
+
+
+def _bridge_duplicate_payload_or_error(
+    message: Message,
+    *,
+    dedupe_key: str,
+    attestation_version: int,
+    body_sha256: str | None,
+    revision: int,
+    supersedes_message_id: str | None,
+) -> dict[str, Any]:
+    if not _same_bridge_attestation(
+        message,
+        attestation_version=attestation_version,
+        body_sha256=body_sha256,
+        revision=revision,
+        supersedes_message_id=supersedes_message_id,
+    ):
+        raise ToolExecutionError(
+            "BRIDGE_DEDUPE_ATTESTATION_MISMATCH",
+            "The bridge dedupe key already exists with different body attestation or revision data.",
+            recoverable=False,
+            data={"bridge_dedupe_id": dedupe_key, "message_id": message.id},
+        )
+    payload = _message_to_dict(message)
+    payload["duplicate"] = True
+    return payload
+
+
+async def _find_inbound_bridge_duplicate(
+    session: Any,
+    *,
+    project_id: int,
+    dedupe_key: str,
+    dedupe_scope: str,
+    source_host: str,
+    source_agent: str,
+    source_project_key: str,
+) -> Message | None:
+    """Find a duplicate only in its receiving project and remote lineage."""
+    result = await session.execute(
+        select(Message)
+        .where(
+            Message.project_id == project_id,
+            Message.bridge_dedupe_id == dedupe_key,
+            _sa_or(
+                Message.bridge_dedupe_scope == dedupe_scope,
+                _sa_and(
+                    Message.bridge_dedupe_scope.is_(None),
+                    func.lower(Message.external_sender_host) == source_host.lower(),
+                    func.lower(Message.external_sender_name) == source_agent.lower(),
+                    Message.external_project_key == source_project_key,
+                ),
+            ),
+        )
+        .limit(1)
+    )
+    return result.scalars().first()
+
+
+async def _find_legacy_bridge_duplicates_without_source_project(
+    session: Any,
+    *,
+    project_id: int,
+    dedupe_key: str,
+    source_host: str,
+    source_agent: str,
+) -> list[Message]:
+    """Resolve old v0 retries only when their missing provenance is unambiguous."""
+    result = await session.execute(
+        select(Message)
+        .where(
+            Message.project_id == project_id,
+            Message.bridge_dedupe_id == dedupe_key,
+            func.lower(Message.external_sender_host) == source_host.lower(),
+            func.lower(Message.external_sender_name) == source_agent.lower(),
+        )
+        .limit(2)
+    )
+    return list(result.scalars().all())
+
+
+async def _find_inbound_revision(
+    session: Any,
+    *,
+    revision_scope: str,
+    revision: int,
+) -> Message | None:
+    result = await session.execute(
+        select(Message)
+        .where(
+            Message.bridge_revision_scope == revision_scope,
+            Message.revision == revision,
+        )
+        .limit(1)
+    )
+    return result.scalars().first()
+
+
+def _revision_duplicate_payload_or_error(
+    message: Message,
+    *,
+    revision_scope: str,
+    attestation_version: int,
+    body_sha256: str | None,
+    revision: int,
+    supersedes_message_id: str | None,
+) -> dict[str, Any]:
+    if (
+        getattr(message, "bridge_revision_scope", None) != revision_scope
+        or not _same_bridge_attestation(
+            message,
+            attestation_version=attestation_version,
+            body_sha256=body_sha256,
+            revision=revision,
+            supersedes_message_id=supersedes_message_id,
+        )
+    ):
+        raise ToolExecutionError(
+            "CONFLICTING_MESSAGE_REVISION",
+            "The inbound lineage already contains a different message at this revision.",
+            recoverable=False,
+            data={"message_id": message.id, "message_revision": revision},
+        )
+    payload = _message_to_dict(message)
+    payload["duplicate"] = True
+    return payload
+
+
+def _attestation_to_dict(message: Message) -> dict[str, Any]:
+    version = int(getattr(message, "attestation_version", 0) or 0)
+    digest = getattr(message, "body_sha256", None)
+    if version == 0 and not digest:
+        status = "legacy_unattested"
+    elif (
+        version == _ATTESTATION_VERSION
+        and isinstance(digest, str)
+        and _BODY_SHA256_RE.fullmatch(digest)
+        and hmac.compare_digest(_body_sha256(message.body_md), digest)
+    ):
+        status = "attested"
+    else:
+        status = "invalid"
+    return {
+        "status": status,
+        "version": version,
+        "body_sha256": digest,
+        "revision": int(getattr(message, "revision", 0) or 0),
+        "supersedes_message_id": getattr(message, "supersedes_message_id", None),
+    }
+
+
+def _validate_inbound_bridge_attestation(
+    *,
+    body_md: str,
+    body_sha256: str | None,
+    attestation_version: int,
+    message_revision: int,
+    supersedes_message_id: object | None,
+) -> tuple[int, str | None, int, str | None]:
+    """Validate the wire contract without treating legacy peers as attested."""
+    try:
+        version = int(attestation_version or 0)
+        revision = int(message_revision or 0)
+    except (TypeError, ValueError) as exc:
+        raise ToolExecutionError(
+            "INVALID_BODY_ATTESTATION",
+            "attestation_version and message_revision must be integers.",
+            recoverable=True,
+        ) from exc
+    try:
+        supersedes = _normalize_supersedes_message_id(supersedes_message_id)
+    except ValueError as exc:
+        raise ToolExecutionError(
+            "INVALID_BODY_ATTESTATION",
+            str(exc),
+            recoverable=True,
+        ) from exc
+    if version == 0:
+        if body_sha256 is not None or revision != 0 or supersedes is not None:
+            raise ToolExecutionError(
+                "INVALID_BODY_ATTESTATION",
+                "Legacy bridge messages must omit digest, revision, and supersession fields.",
+                recoverable=True,
+            )
+        return 0, None, 0, None
+    if version != _ATTESTATION_VERSION:
+        raise ToolExecutionError(
+            "UNSUPPORTED_BODY_ATTESTATION",
+            f"Unsupported attestation_version {version}.",
+            recoverable=True,
+        )
+    if not isinstance(body_sha256, str) or not _BODY_SHA256_RE.fullmatch(body_sha256):
+        raise ToolExecutionError(
+            "INVALID_BODY_ATTESTATION",
+            "Attested bridge messages require a lowercase SHA-256 body digest.",
+            recoverable=True,
+        )
+    expected_digest = _body_sha256(body_md)
+    if not hmac.compare_digest(expected_digest, body_sha256):
+        raise ToolExecutionError(
+            "BODY_DIGEST_MISMATCH",
+            "Bridge body_sha256 does not match the exact UTF-8 body_md payload.",
+            recoverable=False,
+        )
+    if revision < 1:
+        raise ToolExecutionError(
+            "INVALID_BODY_ATTESTATION",
+            "Attested bridge messages require message_revision >= 1.",
+            recoverable=True,
+        )
+    if revision > 1 and supersedes is None:
+        raise ToolExecutionError(
+            "INVALID_BODY_ATTESTATION",
+            "message_revision > 1 requires supersedes_message_id.",
+            recoverable=True,
+        )
+    return version, body_sha256, revision, supersedes
+
+
 def _message_to_dict(message: Message, include_body: bool = True) -> dict[str, Any]:
     data = {
         "id": message.id,
@@ -1802,6 +2094,7 @@ def _message_to_dict(message: Message, include_body: bool = True) -> dict[str, A
         "ack_required": message.ack_required,
         "created_ts": _iso(message.created_ts),
         "attachments": message.attachments,
+        "attestation": _attestation_to_dict(message),
     }
     external_sender_host = getattr(message, "external_sender_host", None)
     external_sender_name = getattr(message, "external_sender_name", None)
@@ -1892,6 +2185,7 @@ def _public_peer_dict(peer: AgentMailPeer) -> dict[str, Any]:
         "api_url": peer.api_url,
         "project_key": peer.project_key,
         "enabled": peer.enabled,
+        "bridge_protocol_version": int(getattr(peer, "bridge_protocol_version", 0) or 0),
         "last_health": peer.last_health,
         "created_ts": _iso(peer.created_ts),
         "updated_ts": _iso(peer.updated_ts),
@@ -1918,6 +2212,27 @@ def _bridge_delivery_dict(delivery: AgentMailBridgeDelivery) -> dict[str, Any]:
     def _nullable_iso(value: Any) -> str | None:
         return _iso(value) if value is not None else None
 
+    delivery_version = int(getattr(delivery, "attestation_version", 0) or 0)
+    delivery_digest = getattr(delivery, "body_sha256", None)
+    delivery_revision = int(getattr(delivery, "message_revision", 0) or 0)
+    delivery_supersedes = getattr(delivery, "supersedes_message_id", None)
+    if (
+        delivery_version == 0
+        and delivery_digest is None
+        and delivery_revision == 0
+        and delivery_supersedes is None
+    ):
+        delivery_attestation_status = "legacy_unattested"
+    elif (
+        delivery_version == _ATTESTATION_VERSION
+        and isinstance(delivery_digest, str)
+        and _BODY_SHA256_RE.fullmatch(delivery_digest)
+        and delivery_revision >= 1
+    ):
+        delivery_attestation_status = "attested"
+    else:
+        delivery_attestation_status = "invalid"
+
     return {
         "id": delivery.id,
         "bridge_id": delivery.bridge_id,
@@ -1928,6 +2243,13 @@ def _bridge_delivery_dict(delivery: AgentMailBridgeDelivery) -> dict[str, Any]:
         "dest_host": delivery.dest_host,
         "dest_agent": delivery.dest_agent,
         "dest_project_key": delivery.dest_project_key,
+        "attestation": {
+            "status": delivery_attestation_status,
+            "version": delivery_version,
+            "body_sha256": delivery_digest,
+            "revision": delivery_revision,
+            "supersedes_message_id": delivery_supersedes,
+        },
         "remote_message_id": delivery.remote_message_id,
         "status": delivery.status,
         "attempts": delivery.attempts,
@@ -2049,6 +2371,7 @@ def _message_frontmatter(
         "ack_required": message.ack_required,
         "created": _iso(message.created_ts),
         "attachments": attachments,
+        "attestation": _attestation_to_dict(message),
     }
 
 def _compute_project_slug(human_key: str) -> str:
@@ -3767,13 +4090,69 @@ async def _create_message(
     external_project_key: Optional[str] = None,
     external_thread_id: Optional[str] = None,
     bridge_dedupe_id: Optional[str] = None,
+    bridge_dedupe_scope: Optional[str] = None,
+    bridge_revision_scope: Optional[str] = None,
+    attestation_version: int = _ATTESTATION_VERSION,
+    body_sha256: Optional[str] = None,
+    revision: Optional[int] = None,
+    supersedes_message_id: object | None = None,
+    derive_revision: bool = True,
 ) -> Message:
     if project.id is None:
         raise ValueError("Project must have an id before creating messages.")
     if sender.id is None:
         raise ValueError("Sender must have an id before sending messages.")
+    try:
+        normalized_attestation_version = int(attestation_version)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("attestation_version must be an integer.") from exc
+    normalized_supersedes = _normalize_supersedes_message_id(supersedes_message_id)
+    requested_revision: int | None
+    if normalized_attestation_version == 0:
+        if body_sha256 is not None or revision not in (None, 0) or normalized_supersedes is not None:
+            raise ValueError("Legacy messages cannot carry attestation or supersession fields.")
+        normalized_digest = None
+        requested_revision = 0
+    elif normalized_attestation_version == _ATTESTATION_VERSION:
+        computed_digest = _body_sha256(body_md)
+        if body_sha256 is not None:
+            if not isinstance(body_sha256, str) or not _BODY_SHA256_RE.fullmatch(body_sha256):
+                raise ValueError("body_sha256 must be a lowercase SHA-256 digest.")
+            if not hmac.compare_digest(computed_digest, body_sha256):
+                raise ValueError("body_sha256 must match the exact UTF-8 body_md payload.")
+        normalized_digest = body_sha256 or computed_digest
+        if revision is None:
+            requested_revision = None
+        else:
+            try:
+                requested_revision = int(revision)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("revision must be an integer.") from exc
+            if requested_revision < 1:
+                raise ValueError("Attested messages require revision >= 1.")
+        if requested_revision is not None and requested_revision > 1 and normalized_supersedes is None:
+            raise ValueError("revision > 1 requires supersedes_message_id.")
+    else:
+        raise ValueError(f"Unsupported attestation_version {normalized_attestation_version}.")
     await ensure_schema()
     async with get_session() as session:
+        normalized_revision = requested_revision
+        if (
+            derive_revision
+            and normalized_supersedes
+            and normalized_supersedes.isdecimal()
+        ):
+            previous_result = await session.execute(
+                select(Message).where(
+                    Message.id == int(normalized_supersedes),
+                    Message.project_id == project.id,
+                )
+            )
+            previous = previous_result.scalars().first()
+            if previous is not None and normalized_attestation_version == _ATTESTATION_VERSION and normalized_revision is None:
+                normalized_revision = max(1, int(getattr(previous, "revision", 0) or 0) + 1)
+        if normalized_attestation_version == _ATTESTATION_VERSION and normalized_revision is None:
+            normalized_revision = 1
         message = Message(
             project_id=project.id,
             sender_id=sender.id,
@@ -3789,6 +4168,12 @@ async def _create_message(
             external_project_key=external_project_key,
             external_thread_id=external_thread_id,
             bridge_dedupe_id=bridge_dedupe_id,
+            bridge_dedupe_scope=bridge_dedupe_scope,
+            bridge_revision_scope=bridge_revision_scope,
+            body_sha256=normalized_digest,
+            attestation_version=normalized_attestation_version,
+            revision=normalized_revision or 0,
+            supersedes_message_id=normalized_supersedes,
             attachments=list(attachments),
         )
         session.add(message)
@@ -3831,30 +4216,46 @@ async def _upsert_remote_identity_record(
             recoverable=True,
             data={"host_key": host_key, "agent_name": agent_name},
         )
-    async with get_session() as session:
-        result = await session.execute(
-            select(AgentMailRemoteIdentity).where(
-                func.lower(AgentMailRemoteIdentity.host_key) == normalized_host.lower(),
-                func.lower(AgentMailRemoteIdentity.agent_name) == normalized_agent.lower(),
-                AgentMailRemoteIdentity.remote_project_key == normalized_project,
+    try:
+        async with get_session() as session:
+            result = await session.execute(
+                select(AgentMailRemoteIdentity).where(
+                    func.lower(AgentMailRemoteIdentity.host_key) == normalized_host.lower(),
+                    func.lower(AgentMailRemoteIdentity.agent_name) == normalized_agent.lower(),
+                    AgentMailRemoteIdentity.remote_project_key == normalized_project,
+                )
             )
-        )
-        identity = result.scalars().first()
+            identity = result.scalars().first()
+            if identity is None:
+                identity = AgentMailRemoteIdentity(
+                    host_key=normalized_host,
+                    agent_name=normalized_agent,
+                    remote_project_key=normalized_project,
+                )
+            identity.program = program
+            identity.model = model
+            identity.capabilities = list(capabilities or [])
+            identity.status = status
+            identity.last_seen_ts = now
+            identity.updated_ts = now
+            session.add(identity)
+            await session.commit()
+            await session.refresh(identity)
+            return identity
+    except IntegrityError:
+        # A concurrent bridge receive may insert the same identity between our
+        # lookup and commit.  It is safe to reuse that already-durable record.
+        async with get_session() as session:
+            result = await session.execute(
+                select(AgentMailRemoteIdentity).where(
+                    func.lower(AgentMailRemoteIdentity.host_key) == normalized_host.lower(),
+                    func.lower(AgentMailRemoteIdentity.agent_name) == normalized_agent.lower(),
+                    AgentMailRemoteIdentity.remote_project_key == normalized_project,
+                )
+            )
+            identity = result.scalars().first()
         if identity is None:
-            identity = AgentMailRemoteIdentity(
-                host_key=normalized_host,
-                agent_name=normalized_agent,
-                remote_project_key=normalized_project,
-            )
-        identity.program = program
-        identity.model = model
-        identity.capabilities = list(capabilities or [])
-        identity.status = status
-        identity.last_seen_ts = now
-        identity.updated_ts = now
-        session.add(identity)
-        await session.commit()
-        await session.refresh(identity)
+            raise
         return identity
 
 
@@ -3872,6 +4273,62 @@ async def _queue_bridge_deliveries(
     source_host = _agent_mail_host_key()
     queued: list[dict[str, Any]] = []
     async with get_session() as session:
+        if local_message_id is None:
+            raise ToolExecutionError(
+                "BRIDGE_SOURCE_NOT_FOUND",
+                "A bridge delivery requires a durable local source message.",
+                recoverable=False,
+            )
+        message_result = await session.execute(select(Message).where(Message.id == local_message_id))
+        source_message = message_result.scalars().first()
+        if source_message is None:
+            raise ToolExecutionError(
+                "BRIDGE_SOURCE_NOT_FOUND",
+                "The bridge delivery source message no longer exists.",
+                recoverable=False,
+                data={"local_message_id": local_message_id},
+            )
+        source_digest = getattr(source_message, "body_sha256", None)
+        source_version = int(getattr(source_message, "attestation_version", 0) or 0)
+        source_revision = int(getattr(source_message, "revision", 0) or 0)
+        source_supersedes = getattr(source_message, "supersedes_message_id", None)
+        if (
+            source_version != _ATTESTATION_VERSION
+            or not isinstance(source_digest, str)
+            or not _BODY_SHA256_RE.fullmatch(source_digest)
+            or source_revision < 1
+            or not hmac.compare_digest(source_digest, _body_sha256(source_message.body_md))
+        ):
+            raise ToolExecutionError(
+                "BRIDGE_SOURCE_UNATTESTED",
+                "Bridge delivery refuses a source message without a valid body attestation.",
+                recoverable=False,
+                data={"local_message_id": local_message_id},
+            )
+        if source_supersedes and source_supersedes.isdecimal():
+            predecessor_result = await session.execute(
+                select(Message)
+                .where(
+                    Message.project_id == project.id,
+                    Message.id == int(source_supersedes),
+                )
+                .limit(1)
+            )
+            predecessor = predecessor_result.scalars().first()
+            if predecessor is not None and predecessor.external_sender_host:
+                # Remote receivers can only verify revisions authored by the
+                # original remote provenance.  Keep a local correction local
+                # instead of silently exporting an unresolvable lineage.
+                raise ToolExecutionError(
+                    "BRIDGE_CROSS_ORIGIN_SUPERSESSION_UNSUPPORTED",
+                    "A message superseding inbound remote provenance cannot be bridged; create a reply instead.",
+                    recoverable=False,
+                    data={
+                        "local_message_id": local_message_id,
+                        "supersedes_message_id": source_supersedes,
+                        "external_sender_host": predecessor.external_sender_host,
+                    },
+                )
         for recipient in remote_recipients:
             host_key = recipient["host_key"].strip()
             agent_name = recipient["agent_name"].strip()
@@ -3910,11 +4367,28 @@ async def _queue_bridge_deliveries(
                     dest_host=host_key,
                     dest_agent=agent_name,
                     dest_project_key=dest_project_key,
+                    body_sha256=source_digest,
+                    attestation_version=source_version,
+                    message_revision=source_revision,
+                    supersedes_message_id=source_supersedes,
                     status="queued",
                     created_ts=now,
                     updated_ts=now,
                 )
             else:
+                if (
+                    delivery.local_message_id != local_message_id
+                    or delivery.body_sha256 != source_digest
+                    or int(getattr(delivery, "attestation_version", 0) or 0) != source_version
+                    or int(getattr(delivery, "message_revision", 0) or 0) != source_revision
+                    or getattr(delivery, "supersedes_message_id", None) != source_supersedes
+                ):
+                    raise ToolExecutionError(
+                        "BRIDGE_DELIVERY_ATTESTATION_MISMATCH",
+                        "The existing bridge delivery has a different source attestation snapshot.",
+                        recoverable=False,
+                        data={"bridge_id": bridge_id, "local_message_id": local_message_id},
+                    )
                 # Preserve a recorded remote project when retrying a bridged
                 # reply; generic Name@Host sends retain their peer default.
                 if dest_project_key:
@@ -4007,6 +4481,45 @@ async def _flush_bridge_deliveries_once(
                 results.append({**_bridge_delivery_dict(current), "transport_state": "failed"})
                 processed += 1
                 continue
+            snapshot_digest = getattr(current, "body_sha256", None)
+            snapshot_version = int(getattr(current, "attestation_version", 0) or 0)
+            snapshot_revision = int(getattr(current, "message_revision", 0) or 0)
+            snapshot_supersedes = getattr(current, "supersedes_message_id", None)
+            message_digest = getattr(message, "body_sha256", None)
+            message_version = int(getattr(message, "attestation_version", 0) or 0)
+            message_revision = int(getattr(message, "revision", 0) or 0)
+            legacy_snapshot = (
+                snapshot_version == 0
+                and snapshot_digest is None
+                and snapshot_revision == 0
+                and snapshot_supersedes is None
+            )
+            legacy_message = (
+                message_version == 0
+                and message_digest is None
+                and message_revision == 0
+                and getattr(message, "supersedes_message_id", None) is None
+            )
+            attested_delivery = (
+                snapshot_version == _ATTESTATION_VERSION
+                and isinstance(snapshot_digest, str)
+                and _BODY_SHA256_RE.fullmatch(snapshot_digest) is not None
+                and snapshot_revision >= 1
+                and message_version == _ATTESTATION_VERSION
+                and message_digest == snapshot_digest
+                and message_revision == snapshot_revision
+                and getattr(message, "supersedes_message_id", None) == snapshot_supersedes
+                and hmac.compare_digest(snapshot_digest, _body_sha256(message.body_md))
+            )
+            if not ((legacy_snapshot and legacy_message) or attested_delivery):
+                current.status = "failed"
+                current.last_error = "source message attestation no longer matches the queued bridge snapshot"
+                current.updated_ts = now
+                session.add(current)
+                await session.commit()
+                results.append({**_bridge_delivery_dict(current), "transport_state": "failed"})
+                processed += 1
+                continue
             if peer is None or not peer.enabled:
                 blocked_error = "bridge peer is not configured or disabled"
                 if current.status == "blocked" and current.last_error == blocked_error:
@@ -4044,6 +4557,21 @@ async def _flush_bridge_deliveries_once(
                 results.append({**_bridge_delivery_dict(current), "transport_state": "blocked"})
                 processed += 1
                 continue
+            if (
+                attested_delivery
+                and int(getattr(peer, "bridge_protocol_version", 0) or 0) < _ATTESTATION_VERSION
+            ):
+                blocked_error = "bridge peer does not support body attestation"
+                if current.status == "blocked" and current.last_error == blocked_error:
+                    continue
+                current.status = "blocked"
+                current.last_error = blocked_error
+                current.updated_ts = now
+                session.add(current)
+                await session.commit()
+                results.append({**_bridge_delivery_dict(current), "transport_state": "blocked"})
+                processed += 1
+                continue
 
             current.status = "sending"
             current.attempts += 1
@@ -4067,6 +4595,7 @@ async def _flush_bridge_deliveries_once(
             dest_agent = current.dest_agent
             bridge_id = current.bridge_id
             attempt_count = current.attempts
+            send_attestation = attested_delivery
 
         args: dict[str, Any] = {
             "project_key": remote_project_key,
@@ -4085,6 +4614,15 @@ async def _flush_bridge_deliveries_once(
             "thread_id": thread_id,
             "topic": topic,
         }
+        if send_attestation:
+            args.update(
+                {
+                    "body_sha256": snapshot_digest,
+                    "attestation_version": snapshot_version,
+                    "message_revision": snapshot_revision,
+                    "supersedes_message_id": snapshot_supersedes,
+                }
+            )
         peer_token = _bridge_outbound_peer_token(peer_host_key)
         if peer_token:
             args["peer_token"] = peer_token
@@ -5433,6 +5971,7 @@ def build_mcp_server() -> FastMCP:
         ack_required: bool,
         thread_id: Optional[str],
         topic: Optional[str] = None,
+        supersedes_message_id: object | None = None,
     ) -> dict[str, Any]:
         # Re-fetch settings at call time so tests that mutate env + clear cache take effect
         settings = get_settings()
@@ -5577,6 +6116,7 @@ def build_mcp_server() -> FastMCP:
                 thread_id,
                 attachments_meta,
                 topic=topic,
+                supersedes_message_id=supersedes_message_id,
             )
             frontmatter = _message_frontmatter(
                 message,
@@ -6934,6 +7474,7 @@ def build_mcp_server() -> FastMCP:
         importance: str = "normal",
         ack_required: bool = False,
         thread_id: Optional[str] = None,
+        supersedes_message_id: Optional[str | int] = None,
         broadcast: bool = False,
         topic: Optional[str] = None,
         auto_contact_if_blocked: bool = False,
@@ -7894,6 +8435,7 @@ def build_mcp_server() -> FastMCP:
                 ack_required,
                 thread_id,
                 topic=topic,
+                supersedes_message_id=supersedes_message_id,
             )
             deliveries.append({"project": project.human_key, "payload": payload_local})
         # External per-target project deliver (requires aliasing sender in target project)
@@ -7917,6 +8459,7 @@ def build_mcp_server() -> FastMCP:
                     ack_required,
                     thread_id,
                     topic=topic,
+                    supersedes_message_id=supersedes_message_id,
                 )
                 deliveries.append({"project": p.human_key, "payload": payload_ext})
             except Exception:
@@ -7943,6 +8486,7 @@ def build_mcp_server() -> FastMCP:
                     thread_id,
                     [],
                     topic=topic,
+                    supersedes_message_id=supersedes_message_id,
                 )
                 local_message_id = audit_message.id
                 audit_payload = _message_to_dict(audit_message)
@@ -8049,6 +8593,7 @@ def build_mcp_server() -> FastMCP:
         project_key: str = "",
         auth_token: Optional[str] = None,
         enabled: bool = True,
+        bridge_protocol_version: Optional[int] = None,
         last_health: Optional[str] = None,
         format: Optional[str] = None,
     ) -> dict[str, Any]:
@@ -8056,6 +8601,23 @@ def build_mcp_server() -> FastMCP:
         normalized_host = host_key.strip()
         if not normalized_host:
             raise ToolExecutionError("INVALID_ARGUMENT", "host_key is required.", recoverable=True)
+        if bridge_protocol_version is not None:
+            try:
+                normalized_protocol_version = int(bridge_protocol_version)
+            except (TypeError, ValueError) as exc:
+                raise ToolExecutionError(
+                    "INVALID_ARGUMENT",
+                    "bridge_protocol_version must be an integer.",
+                    recoverable=True,
+                ) from exc
+            if normalized_protocol_version not in (0, _ATTESTATION_VERSION):
+                raise ToolExecutionError(
+                    "INVALID_ARGUMENT",
+                    "bridge_protocol_version must be 0 (legacy) or 1 (attested).",
+                    recoverable=True,
+                )
+        else:
+            normalized_protocol_version = None
         await ensure_schema()
         now = _naive_utc()
         async with get_session() as session:
@@ -8072,6 +8634,8 @@ def build_mcp_server() -> FastMCP:
             if auth_token:
                 peer.auth_token_hash = _hash_bridge_token(auth_token)
             peer.enabled = enabled
+            if normalized_protocol_version is not None:
+                peer.bridge_protocol_version = normalized_protocol_version
             if last_health is not None:
                 peer.last_health = last_health
             peer.updated_ts = now
@@ -8127,6 +8691,10 @@ def build_mcp_server() -> FastMCP:
         external_thread_id: Optional[str] = None,
         bridge_dedupe_id: Optional[str] = None,
         bridge_id: Optional[str] = None,
+        body_sha256: Optional[str] = None,
+        attestation_version: int = 0,
+        message_revision: int = 0,
+        supersedes_message_id: Optional[str | int] = None,
         peer_token: Optional[str] = None,
         importance: str = "normal",
         ack_required: bool = False,
@@ -8143,13 +8711,47 @@ def build_mcp_server() -> FastMCP:
             raise ToolExecutionError("INVALID_ARGUMENT", "to must contain at least one local agent name.", recoverable=True)
         source_host = source_host.strip()
         source_agent = source_agent.strip()
+        source_project_key = str(source_project_key or "").strip()
         if not source_host or not source_agent:
             raise ToolExecutionError(
                 "INVALID_ARGUMENT",
                 "source_host and source_agent are required.",
                 recoverable=True,
             )
+        (
+            normalized_attestation_version,
+            normalized_digest,
+            normalized_revision,
+            normalized_supersedes,
+        ) = _validate_inbound_bridge_attestation(
+            body_md=body_md,
+            body_sha256=body_sha256,
+            attestation_version=attestation_version,
+            message_revision=message_revision,
+            supersedes_message_id=supersedes_message_id,
+        )
         await ensure_schema()
+        if project.id is None:
+            raise ToolExecutionError("PROJECT_NOT_FOUND", "Project must be persisted before bridge receive.", recoverable=False)
+        dedupe_key = bridge_dedupe_id or (
+            f"{source_host}:{external_message_id}" if external_message_id else ""
+        )
+        dedupe_scope = (
+            _bridge_dedupe_scope(project.id, source_host, source_agent, source_project_key)
+            if dedupe_key
+            else None
+        )
+        revision_scope = (
+            _bridge_revision_scope(
+                project.id,
+                source_host,
+                source_agent,
+                source_project_key,
+                normalized_supersedes,
+            )
+            if normalized_attestation_version == _ATTESTATION_VERSION and normalized_supersedes
+            else None
+        )
         async with get_session() as session:
             peer_result = await session.execute(
                 select(AgentMailPeer).where(func.lower(AgentMailPeer.host_key) == source_host.lower())
@@ -8168,18 +8770,83 @@ def build_mcp_server() -> FastMCP:
                     "Invalid or missing peer_token for bridge_receive_message.",
                     recoverable=True,
                 )
-            dedupe_key = bridge_dedupe_id or (
-                f"{source_host}:{external_message_id}" if external_message_id else ""
-            )
             if dedupe_key:
-                existing = await session.execute(
-                    select(Message).where(Message.bridge_dedupe_id == dedupe_key).limit(1)
-                )
-                existing_message = existing.scalars().first()
+                assert dedupe_scope is not None
+                if normalized_attestation_version == 0 and not source_project_key:
+                    legacy_candidates = await _find_legacy_bridge_duplicates_without_source_project(
+                        session,
+                        project_id=project.id,
+                        dedupe_key=dedupe_key,
+                        source_host=source_host,
+                        source_agent=source_agent,
+                    )
+                    if len(legacy_candidates) > 1:
+                        raise ToolExecutionError(
+                            "BRIDGE_DEDUPE_PROVENANCE_AMBIGUOUS",
+                            "Legacy bridge retry omits source_project_key and matches multiple provenance records.",
+                            recoverable=False,
+                            data={"bridge_dedupe_id": dedupe_key},
+                        )
+                    existing_message = legacy_candidates[0] if legacy_candidates else None
+                else:
+                    existing_message = await _find_inbound_bridge_duplicate(
+                        session,
+                        project_id=project.id,
+                        dedupe_key=dedupe_key,
+                        dedupe_scope=dedupe_scope,
+                        source_host=source_host,
+                        source_agent=source_agent,
+                        source_project_key=source_project_key,
+                    )
                 if existing_message is not None:
-                    payload = _message_to_dict(existing_message)
-                    payload["duplicate"] = True
-                    return payload
+                    return _bridge_duplicate_payload_or_error(
+                        existing_message,
+                        dedupe_key=dedupe_key,
+                        attestation_version=normalized_attestation_version,
+                        body_sha256=normalized_digest,
+                        revision=normalized_revision,
+                        supersedes_message_id=normalized_supersedes,
+                    )
+            if normalized_attestation_version == _ATTESTATION_VERSION and normalized_supersedes:
+                previous_result = await session.execute(
+                    select(Message)
+                    .where(
+                        Message.project_id == project.id,
+                        func.lower(Message.external_sender_host) == source_host.lower(),
+                        func.lower(Message.external_sender_name) == source_agent.lower(),
+                        Message.external_project_key == source_project_key,
+                        Message.external_message_id == normalized_supersedes,
+                    )
+                    .order_by(Message.id.desc())
+                    .limit(1)
+                )
+                previous = previous_result.scalars().first()
+                if previous is not None and normalized_revision <= int(getattr(previous, "revision", 0) or 0):
+                    raise ToolExecutionError(
+                        "NON_MONOTONIC_MESSAGE_REVISION",
+                        "The inbound revision must be greater than the superseded message revision.",
+                        recoverable=False,
+                        data={
+                            "supersedes_message_id": normalized_supersedes,
+                            "previous_revision": int(getattr(previous, "revision", 0) or 0),
+                            "message_revision": normalized_revision,
+                        },
+                    )
+            if revision_scope is not None:
+                existing_revision = await _find_inbound_revision(
+                    session,
+                    revision_scope=revision_scope,
+                    revision=normalized_revision,
+                )
+                if existing_revision is not None:
+                    return _revision_duplicate_payload_or_error(
+                        existing_revision,
+                        revision_scope=revision_scope,
+                        attestation_version=normalized_attestation_version,
+                        body_sha256=normalized_digest,
+                        revision=normalized_revision,
+                        supersedes_message_id=normalized_supersedes,
+                    )
 
         await _upsert_remote_identity_record(
             host_key=source_host,
@@ -8198,24 +8865,109 @@ def build_mcp_server() -> FastMCP:
         )
         recipient_map = await _get_agents_batch(project, [item.strip() for item in to])
         recipients = [(recipient_map[item.strip()], "to") for item in to]
-        message = await _create_message(
-            project,
-            bridge_agent,
-            subject,
-            body_md,
-            recipients,
-            importance,
-            ack_required,
-            thread_id or external_thread_id,
-            [],
-            topic=topic,
-            external_sender_host=source_host,
-            external_sender_name=source_agent,
-            external_message_id=external_message_id,
-            external_project_key=source_project_key,
-            external_thread_id=external_thread_id,
-            bridge_dedupe_id=bridge_dedupe_id or (f"{source_host}:{external_message_id}" if external_message_id else None),
-        )
+        try:
+            message = await _create_message(
+                project,
+                bridge_agent,
+                subject,
+                body_md,
+                recipients,
+                importance,
+                ack_required,
+                thread_id or external_thread_id,
+                [],
+                topic=topic,
+                external_sender_host=source_host,
+                external_sender_name=source_agent,
+                external_message_id=external_message_id,
+                external_project_key=source_project_key,
+                external_thread_id=external_thread_id,
+                bridge_dedupe_id=dedupe_key or None,
+                bridge_dedupe_scope=dedupe_scope,
+                bridge_revision_scope=revision_scope,
+                attestation_version=normalized_attestation_version,
+                body_sha256=normalized_digest,
+                revision=normalized_revision,
+                supersedes_message_id=normalized_supersedes,
+                derive_revision=False,
+            )
+        except IntegrityError as exc:
+            # A concurrent retry can pass the first lookup before another
+            # transaction commits.  Re-read the scoped row and make identical
+            # retries idempotent; propagate every unrelated constraint error.
+            if not dedupe_key or dedupe_scope is None:
+                if revision_scope is None:
+                    raise
+                async with get_session() as session:
+                    existing_revision = await _find_inbound_revision(
+                        session,
+                        revision_scope=revision_scope,
+                        revision=normalized_revision,
+                    )
+                if existing_revision is None:
+                    raise
+                return _revision_duplicate_payload_or_error(
+                    existing_revision,
+                    revision_scope=revision_scope,
+                    attestation_version=normalized_attestation_version,
+                    body_sha256=normalized_digest,
+                    revision=normalized_revision,
+                    supersedes_message_id=normalized_supersedes,
+                )
+            async with get_session() as session:
+                if normalized_attestation_version == 0 and not source_project_key:
+                    legacy_candidates = await _find_legacy_bridge_duplicates_without_source_project(
+                        session,
+                        project_id=project.id,
+                        dedupe_key=dedupe_key,
+                        source_host=source_host,
+                        source_agent=source_agent,
+                    )
+                    if len(legacy_candidates) > 1:
+                        raise ToolExecutionError(
+                            "BRIDGE_DEDUPE_PROVENANCE_AMBIGUOUS",
+                            "Legacy bridge retry omits source_project_key and matches multiple provenance records.",
+                            recoverable=False,
+                            data={"bridge_dedupe_id": dedupe_key},
+                        ) from exc
+                    existing_message = legacy_candidates[0] if legacy_candidates else None
+                else:
+                    existing_message = await _find_inbound_bridge_duplicate(
+                        session,
+                        project_id=project.id,
+                        dedupe_key=dedupe_key,
+                        dedupe_scope=dedupe_scope,
+                        source_host=source_host,
+                        source_agent=source_agent,
+                        source_project_key=source_project_key,
+                    )
+            if existing_message is None:
+                if revision_scope is None:
+                    raise
+                async with get_session() as session:
+                    existing_revision = await _find_inbound_revision(
+                        session,
+                        revision_scope=revision_scope,
+                        revision=normalized_revision,
+                    )
+                if existing_revision is None:
+                    raise
+                return _revision_duplicate_payload_or_error(
+                    existing_revision,
+                    revision_scope=revision_scope,
+                    attestation_version=normalized_attestation_version,
+                    body_sha256=normalized_digest,
+                    revision=normalized_revision,
+                    supersedes_message_id=normalized_supersedes,
+                )
+            return _bridge_duplicate_payload_or_error(
+                existing_message,
+                dedupe_key=dedupe_key,
+                attestation_version=normalized_attestation_version,
+                body_sha256=normalized_digest,
+                revision=normalized_revision,
+                supersedes_message_id=normalized_supersedes,
+            )
         payload = _message_to_dict(message)
         payload.update(
             {

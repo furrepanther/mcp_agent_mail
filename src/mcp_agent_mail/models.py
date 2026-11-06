@@ -111,6 +111,18 @@ class Message(SQLModel, table=True):
     external_project_key: Optional[str] = Field(default=None, max_length=255)
     external_thread_id: Optional[str] = Field(default=None, max_length=128)
     bridge_dedupe_id: Optional[str] = Field(default=None, max_length=255, index=True)
+    # Hash of the receiving project plus remote provenance.  The same remote
+    # dedupe token is valid in independent projects and sender lineages.
+    bridge_dedupe_scope: Optional[str] = Field(default=None, max_length=64)
+    # Hash of an inbound supersession lineage.  It prevents two competing
+    # remote revisions from claiming the same parent/revision identity.
+    bridge_revision_scope: Optional[str] = Field(default=None, max_length=64)
+    # Version 0 deliberately denotes pre-attestation history. New messages use
+    # version 1 and retain an exact UTF-8 body digest plus append-only lineage.
+    body_sha256: Optional[str] = Field(default=None, max_length=64)
+    attestation_version: int = Field(default=0)
+    revision: int = Field(default=0)
+    supersedes_message_id: Optional[str] = Field(default=None, max_length=128)
     attachments: list[dict[str, Any]] = Field(
         default_factory=list,
         sa_column=Column(JSON, nullable=False, server_default="[]"),
@@ -133,6 +145,9 @@ class AgentMailPeer(SQLModel, table=True):
     project_key: str = Field(default="", max_length=255)
     auth_token_hash: Optional[str] = Field(default=None, max_length=128)
     enabled: bool = Field(default=True)
+    # 0 is the pre-attestation bridge schema.  Attested deliveries are sent
+    # only after an operator records a peer that understands protocol v1.
+    bridge_protocol_version: int = Field(default=0)
     last_health: Optional[str] = Field(default=None, max_length=32)
     created_ts: datetime = Field(default_factory=_utcnow_naive)
     updated_ts: datetime = Field(default_factory=_utcnow_naive)
@@ -183,6 +198,12 @@ class AgentMailBridgeDelivery(SQLModel, table=True):
     dest_host: str = Field(max_length=64, index=True)
     dest_agent: str = Field(max_length=128, index=True)
     dest_project_key: str = Field(default="", max_length=255)
+    # Snapshot the source message attestation when the delivery is queued so a
+    # later source mutation cannot silently change what crosses the bridge.
+    body_sha256: Optional[str] = Field(default=None, max_length=64)
+    attestation_version: int = Field(default=0)
+    message_revision: int = Field(default=0)
+    supersedes_message_id: Optional[str] = Field(default=None, max_length=128)
     remote_message_id: Optional[str] = Field(default=None, max_length=128)
     status: str = Field(default="queued", max_length=32)
     attempts: int = Field(default=0)

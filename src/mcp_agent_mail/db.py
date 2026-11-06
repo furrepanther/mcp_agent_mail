@@ -751,6 +751,18 @@ def reset_database_state() -> None:
     clear_settings_cache()
 
 
+def _apply_add_column_migration(connection: Any, migration_sql: str) -> None:
+    """Apply a SQLite ADD COLUMN migration without hiding real schema failures."""
+    try:
+        connection.exec_driver_sql(migration_sql)
+    except OperationalError as exc:
+        # SQLite has no IF NOT EXISTS for ADD COLUMN. Re-running an already
+        # applied migration is the only expected failure condition.
+        if "duplicate column name" in str(exc).lower():
+            return
+        raise
+
+
 def _setup_fts(connection: Any) -> None:
     connection.exec_driver_sql(
         "CREATE VIRTUAL TABLE IF NOT EXISTS fts_messages USING fts5(message_id UNINDEXED, subject, body)"
@@ -845,7 +857,8 @@ def _setup_fts(connection: Any) -> None:
         "ON agent_links(status)"
     )
     # Schema migrations: add columns that may be missing on older databases.
-    # SQLite ALTER TABLE ADD COLUMN is idempotent-safe via try/except.
+    # SQLite lacks ADD COLUMN IF NOT EXISTS, so only the known duplicate-column
+    # result is accepted; every other migration failure stops schema setup.
     for migration_sql in [
         "ALTER TABLE agents ADD COLUMN retired_at DATETIME DEFAULT NULL",
         "ALTER TABLE projects ADD COLUMN archived_at DATETIME DEFAULT NULL",
@@ -857,18 +870,36 @@ def _setup_fts(connection: Any) -> None:
         "ALTER TABLE messages ADD COLUMN external_project_key VARCHAR(255) DEFAULT NULL",
         "ALTER TABLE messages ADD COLUMN external_thread_id VARCHAR(128) DEFAULT NULL",
         "ALTER TABLE messages ADD COLUMN bridge_dedupe_id VARCHAR(255) DEFAULT NULL",
+        "ALTER TABLE messages ADD COLUMN bridge_dedupe_scope VARCHAR(64) DEFAULT NULL",
+        "ALTER TABLE messages ADD COLUMN bridge_revision_scope VARCHAR(64) DEFAULT NULL",
+        "ALTER TABLE messages ADD COLUMN body_sha256 VARCHAR(64) DEFAULT NULL",
+        "ALTER TABLE messages ADD COLUMN attestation_version INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE messages ADD COLUMN revision INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE messages ADD COLUMN supersedes_message_id VARCHAR(128) DEFAULT NULL",
+        "ALTER TABLE agent_mail_bridge_deliveries ADD COLUMN body_sha256 VARCHAR(64) DEFAULT NULL",
+        "ALTER TABLE agent_mail_bridge_deliveries ADD COLUMN attestation_version INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE agent_mail_bridge_deliveries ADD COLUMN message_revision INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE agent_mail_bridge_deliveries ADD COLUMN supersedes_message_id VARCHAR(128) DEFAULT NULL",
+        "ALTER TABLE agent_mail_peers ADD COLUMN bridge_protocol_version INTEGER NOT NULL DEFAULT 0",
     ]:
-        with suppress(Exception):  # Column already exists — safe to ignore
-            connection.exec_driver_sql(migration_sql)
+        _apply_add_column_migration(connection, migration_sql)
 
     # Index migrations for newly added columns.
     # CREATE INDEX IF NOT EXISTS is natively idempotent in SQLite.
+    # The original global dedupe index was too broad: the same remote token is
+    # legitimate for distinct receiving projects or remote sender lineages.
+    connection.exec_driver_sql("DROP INDEX IF EXISTS ux_messages_bridge_dedupe_id")
     for index_sql in [
         "CREATE INDEX IF NOT EXISTS ix_agents_registration_token ON agents (registration_token)",
         "CREATE INDEX IF NOT EXISTS idx_messages_project_topic ON messages (project_id, topic)",
         "CREATE INDEX IF NOT EXISTS idx_messages_external_sender ON messages (external_sender_host, external_message_id)",
-        "CREATE UNIQUE INDEX IF NOT EXISTS ux_messages_bridge_dedupe_id "
-        "ON messages (bridge_dedupe_id) WHERE bridge_dedupe_id IS NOT NULL",
+        "CREATE INDEX IF NOT EXISTS idx_messages_supersedes ON messages (project_id, supersedes_message_id)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_messages_bridge_dedupe_scope "
+        "ON messages (project_id, bridge_dedupe_scope, bridge_dedupe_id) "
+        "WHERE bridge_dedupe_scope IS NOT NULL AND bridge_dedupe_id IS NOT NULL",
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_messages_bridge_revision_lineage "
+        "ON messages (bridge_revision_scope, revision) "
+        "WHERE bridge_revision_scope IS NOT NULL",
         "CREATE UNIQUE INDEX IF NOT EXISTS ux_agent_mail_peer_host_key ON agent_mail_peers (host_key)",
         "CREATE INDEX IF NOT EXISTS idx_agent_mail_peers_enabled ON agent_mail_peers (enabled)",
         "CREATE UNIQUE INDEX IF NOT EXISTS ux_agent_mail_remote_identity "
@@ -880,8 +911,67 @@ def _setup_fts(connection: Any) -> None:
         "CREATE INDEX IF NOT EXISTS idx_agent_mail_bridge_dest ON agent_mail_bridge_deliveries (dest_host, dest_agent)",
         "CREATE INDEX IF NOT EXISTS idx_agent_mail_bridge_local_message ON agent_mail_bridge_deliveries (local_message_id)",
     ]:
-        with suppress(Exception):
-            connection.exec_driver_sql(index_sql)
+        connection.exec_driver_sql(index_sql)
+
+    # Attested messages are append-only. Legacy rows stay mutable so existing
+    # history remains usable, but they cannot be retroactively attested: a
+    # corrected message must be a new superseding revision.
+    # Recreate these triggers on migration so their invariant is upgraded with
+    # the code instead of retaining an older CREATE TRIGGER IF NOT EXISTS body.
+    connection.exec_driver_sql("DROP TRIGGER IF EXISTS messages_legacy_attestation_immutable")
+    connection.exec_driver_sql("DROP TRIGGER IF EXISTS messages_attested_immutable")
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER IF NOT EXISTS messages_legacy_attestation_immutable
+        BEFORE UPDATE OF attestation_version, body_sha256, revision, supersedes_message_id, bridge_dedupe_scope, bridge_revision_scope ON messages
+        FOR EACH ROW
+        WHEN OLD.attestation_version = 0 AND (
+            NEW.attestation_version != 0 OR
+            NEW.body_sha256 IS NOT NULL OR
+            NEW.revision != 0 OR
+            NEW.supersedes_message_id IS NOT NULL OR
+            NEW.bridge_dedupe_scope IS NOT NULL OR
+            NEW.bridge_revision_scope IS NOT NULL
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'legacy messages must remain unattested; create a superseding revision');
+        END;
+        """
+    )
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER IF NOT EXISTS messages_attested_immutable
+        BEFORE UPDATE ON messages
+        FOR EACH ROW
+        WHEN OLD.attestation_version >= 1 AND (
+            NEW.project_id IS NOT OLD.project_id OR
+            NEW.sender_id IS NOT OLD.sender_id OR
+            NEW.thread_id IS NOT OLD.thread_id OR
+            NEW.topic IS NOT OLD.topic OR
+            NEW.subject IS NOT OLD.subject OR
+            NEW.body_md IS NOT OLD.body_md OR
+            NEW.importance IS NOT OLD.importance OR
+            NEW.ack_required IS NOT OLD.ack_required OR
+            NEW.created_ts IS NOT OLD.created_ts OR
+            NEW.external_sender_host IS NOT OLD.external_sender_host OR
+            NEW.external_sender_name IS NOT OLD.external_sender_name OR
+            NEW.external_message_id IS NOT OLD.external_message_id OR
+            NEW.external_project_key IS NOT OLD.external_project_key OR
+            NEW.external_thread_id IS NOT OLD.external_thread_id OR
+            NEW.bridge_dedupe_id IS NOT OLD.bridge_dedupe_id OR
+            NEW.bridge_dedupe_scope IS NOT OLD.bridge_dedupe_scope OR
+            NEW.bridge_revision_scope IS NOT OLD.bridge_revision_scope OR
+            NEW.body_sha256 IS NOT OLD.body_sha256 OR
+            NEW.attestation_version IS NOT OLD.attestation_version OR
+            NEW.revision IS NOT OLD.revision OR
+            NEW.supersedes_message_id IS NOT OLD.supersedes_message_id OR
+            NEW.attachments IS NOT OLD.attachments
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'attested message content and provenance are immutable; create a superseding revision');
+        END;
+        """
+    )
 
 
 def get_database_path(settings: Settings | None = None) -> Path | None:
