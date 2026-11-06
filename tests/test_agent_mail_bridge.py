@@ -63,6 +63,152 @@ async def test_name_at_host_queues_remote_delivery(isolated_env, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_reply_to_bridged_message_routes_to_remote_sender_and_preserves_thread(isolated_env, monkeypatch):
+    monkeypatch.setenv("AGENT_MAIL_HOST_KEY", "Datacube")
+    calls = []
+
+    async def fake_call_bridge_peer_tool(**kwargs):
+        calls.append(kwargs)
+        return {"id": 4243}
+
+    monkeypatch.setattr(app_module, "_call_bridge_peer_tool", fake_call_bridge_peer_tool)
+    server = build_mcp_server()
+    async with Client(server) as client:
+        await client.call_tool("ensure_project", {"human_key": "/home/Antigravity"})
+        await client.call_tool(
+            "register_agent",
+            {
+                "project_key": "/home/Antigravity",
+                "program": "codex",
+                "model": "gpt-5",
+                "name": "RoseStone",
+            },
+        )
+        await client.call_tool(
+            "upsert_bridge_peer",
+            {
+                "host_key": "Primus",
+                "api_url": "http://127.0.0.1:18766/api/",
+                "project_key": "/peer-default-project",
+            },
+        )
+        inbound = await client.call_tool(
+            "bridge_receive_message",
+            {
+                "project_key": "/home/Antigravity",
+                "to": ["RoseStone"],
+                "subject": "Remote work order",
+                "body_md": "Please verify the bridge reply path.",
+                "source_host": "Primus",
+                "source_agent": "SwiftCat",
+                "source_project_key": "/remote-origin-project",
+                "external_message_id": "primus-42",
+                "external_thread_id": "primus-thread-42",
+                "bridge_dedupe_id": "primus:42:datacube",
+            },
+        )
+
+        reply_body = "Bridge reply repaired: human-readable evidence is attached to the original thread."
+        replied = await client.call_tool(
+            "reply_message",
+            {
+                "project_key": "/home/Antigravity",
+                "message_id": inbound.data["id"],
+                "sender_name": "RoseStone",
+                "body_md": reply_body,
+            },
+        )
+
+        assert replied.data["reply_to"] == inbound.data["id"]
+        assert replied.data["thread_id"] == "primus-thread-42"
+        assert replied.data["remote_delivery_state"] == "queued_remote"
+        bridge = replied.data["bridge_deliveries"][0]
+        assert bridge["dest_host"] == "Primus"
+        assert bridge["dest_agent"] == "SwiftCat"
+        assert bridge["dest_project_key"] == "/remote-origin-project"
+
+        flushed = await client.call_tool("flush_bridge_deliveries", {"dest_host": "Primus", "limit": 1})
+        assert flushed.data["delivered"] == 1
+        assert calls[0]["tool_name"] == "bridge_receive_message"
+        args = calls[0]["arguments"]
+        assert args["to"] == ["SwiftCat"]
+        assert args["project_key"] == "/remote-origin-project"
+        assert args["body_md"] == reply_body
+        assert args["external_thread_id"] == "primus-thread-42"
+
+
+@pytest.mark.asyncio
+async def test_reply_to_bridged_message_without_remote_project_fails_closed(isolated_env, monkeypatch):
+    monkeypatch.setenv("AGENT_MAIL_HOST_KEY", "Datacube")
+    bridge_calls = []
+    error_types = []
+
+    async def fake_call_bridge_peer_tool(**kwargs):
+        bridge_calls.append(kwargs)
+        return {"id": 4243}
+
+    def capture_tool_error(_tool_name, error):
+        error_types.append(error.error_type)
+
+    monkeypatch.setattr(app_module, "_call_bridge_peer_tool", fake_call_bridge_peer_tool)
+    monkeypatch.setattr(app_module, "_record_tool_error", capture_tool_error)
+    server = build_mcp_server()
+    async with Client(server) as client:
+        await client.call_tool("ensure_project", {"human_key": "/home/Antigravity"})
+        await client.call_tool(
+            "register_agent",
+            {
+                "project_key": "/home/Antigravity",
+                "program": "codex",
+                "model": "gpt-5",
+                "name": "RoseStone",
+            },
+        )
+        await client.call_tool(
+            "upsert_bridge_peer",
+            {
+                "host_key": "Primus",
+                "api_url": "http://127.0.0.1:18766/api/",
+                "project_key": "/peer-default-project",
+            },
+        )
+        inbound = await client.call_tool(
+            "bridge_receive_message",
+            {
+                "project_key": "/home/Antigravity",
+                "to": ["RoseStone"],
+                "subject": "Remote work order without project provenance",
+                "body_md": "This input intentionally omits source_project_key.",
+                "source_host": "Primus",
+                "source_agent": "SwiftCat",
+                "external_message_id": "primus-missing-project",
+                "external_thread_id": "primus-thread-missing-project",
+                "bridge_dedupe_id": "primus:missing-project:datacube",
+            },
+        )
+
+        before = await client.call_tool("list_bridge_deliveries", {"dest_host": "Primus"})
+        failed = await client.call_tool_mcp(
+            "reply_message",
+            {
+                "project_key": "/home/Antigravity",
+                "message_id": inbound.data["id"],
+                "sender_name": "RoseStone",
+                "body_md": "Do not route this reply to the peer default project.",
+            },
+        )
+        error_text = " ".join(getattr(content, "text", "") for content in failed.content)
+        after = await client.call_tool("list_bridge_deliveries", {"dest_host": "Primus"})
+
+        assert failed.isError is True
+        assert error_types == ["INVALID_REMOTE_PROVENANCE"]
+        assert "original remote project key" in error_text
+        assert before.data == []
+        assert after.data == []
+        assert bridge_calls == []
+
+
+@pytest.mark.asyncio
 async def test_bridge_receive_preserves_remote_provenance(isolated_env, monkeypatch):
     monkeypatch.setenv("AGENT_MAIL_HOST_KEY", "Primus")
     server = build_mcp_server()

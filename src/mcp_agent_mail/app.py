@@ -3875,6 +3875,7 @@ async def _queue_bridge_deliveries(
         for recipient in remote_recipients:
             host_key = recipient["host_key"].strip()
             agent_name = recipient["agent_name"].strip()
+            dest_project_key = str(recipient.get("dest_project_key", "") or "").strip()
             identity_result = await session.execute(
                 select(AgentMailRemoteIdentity).where(
                     func.lower(AgentMailRemoteIdentity.host_key) == host_key.lower(),
@@ -3908,12 +3909,16 @@ async def _queue_bridge_deliveries(
                     source_project_key=project.human_key,
                     dest_host=host_key,
                     dest_agent=agent_name,
-                    dest_project_key="",
+                    dest_project_key=dest_project_key,
                     status="queued",
                     created_ts=now,
                     updated_ts=now,
                 )
             else:
+                # Preserve a recorded remote project when retrying a bridged
+                # reply; generic Name@Host sends retain their peer default.
+                if dest_project_key:
+                    delivery.dest_project_key = dest_project_key
                 delivery.updated_ts = now
             session.add(delivery)
             await session.flush()
@@ -8462,9 +8467,44 @@ def build_mcp_server() -> FastMCP:
             reply_subject = base_subject
         else:
             reply_subject = f"{subject_prefix_clean} {base_subject}".strip()
-        to_names = to or [original_sender.name]
+        # A bridged inbound message is represented locally by the bridge
+        # agent, but its reply must return to the recorded remote sender.
+        # Falling back to the bridge agent silently leaves the reply local.
+        external_sender_host = str(getattr(original, "external_sender_host", "") or "").strip()
+        external_sender_name = str(getattr(original, "external_sender_name", "") or "").strip()
+        external_project_key = str(getattr(original, "external_project_key", "") or "").strip()
+        default_reply_recipient = original_sender.name
+        if external_sender_host and external_sender_name:
+            default_reply_recipient = f"{external_sender_name}@{external_sender_host}"
+        to_names = to or [default_reply_recipient]
         cc_list = cc or []
         bcc_list = bcc or []
+
+        # Match send_message: federated Name@Host recipients must be removed
+        # before local/cross-project routing and queued through the bridge.
+        remote_bridge_recipients: list[dict[str, str]] = []
+        to_names, remote_to = _partition_bridge_recipients(to_names, "to")
+        cc_list, remote_cc = _partition_bridge_recipients(cc_list, "cc")
+        bcc_list, remote_bcc = _partition_bridge_recipients(bcc_list, "bcc")
+        remote_bridge_recipients.extend(remote_to)
+        remote_bridge_recipients.extend(remote_cc)
+        remote_bridge_recipients.extend(remote_bcc)
+        if external_sender_host and external_sender_name:
+            bridged_reply_recipients = [
+                recipient
+                for recipient in remote_bridge_recipients
+                if _normalize_bridge_host(recipient["host_key"]) == _normalize_bridge_host(external_sender_host)
+                and recipient["agent_name"].casefold() == external_sender_name.casefold()
+            ]
+            if bridged_reply_recipients and not external_project_key:
+                raise ToolExecutionError(
+                    "INVALID_REMOTE_PROVENANCE",
+                    "Bridged reply cannot be routed without the original remote project key.",
+                    recoverable=True,
+                )
+            for recipient in bridged_reply_recipients:
+                # Do not fall back to the peer's default project for replies.
+                recipient["dest_project_key"] = external_project_key
 
         local_to: list[str] = []
         local_cc: list[str] = []
@@ -8604,6 +8644,56 @@ def build_mcp_server() -> FastMCP:
             except Exception:
                 continue
 
+        bridge_deliveries: list[dict[str, Any]] = []
+        if remote_bridge_recipients:
+            local_message_id: int | None = None
+            for delivery in deliveries:
+                payload = delivery.get("payload")
+                if isinstance(payload, dict) and isinstance(payload.get("id"), int):
+                    local_message_id = payload["id"]
+                    break
+            if local_message_id is None:
+                # A bridge-only reply still needs a durable local record so
+                # the transport can preserve its body and thread provenance.
+                audit_message = await _create_message(
+                    project,
+                    sender,
+                    reply_subject,
+                    body_md,
+                    [],
+                    original.importance,
+                    original.ack_required,
+                    thread_key,
+                    [],
+                    topic=original.topic,
+                )
+                local_message_id = audit_message.id
+                audit_payload = _message_to_dict(audit_message)
+                audit_payload.update(
+                    {
+                        "from": sender.name,
+                        "to": [],
+                        "cc": [],
+                        "bcc": [],
+                        "remote_recipients": remote_bridge_recipients,
+                    }
+                )
+                deliveries.append({"project": project.human_key, "payload": audit_payload, "bridge_audit": True})
+            bridge_deliveries = await _queue_bridge_deliveries(
+                local_message_id=local_message_id,
+                project=project,
+                sender=sender,
+                remote_recipients=remote_bridge_recipients,
+            )
+            for item in bridge_deliveries:
+                deliveries.append(
+                    {
+                        "project": f"{item['dest_agent']}@{item['dest_host']}",
+                        "payload": item,
+                        "delivery_state": "queued_remote",
+                    }
+                )
+
         if not deliveries:
             return {
                 "thread_id": thread_key,
@@ -8618,6 +8708,9 @@ def build_mcp_server() -> FastMCP:
         primary_payload["reply_to"] = message_id
         primary_payload["deliveries"] = deliveries
         primary_payload["count"] = len(deliveries)
+        if bridge_deliveries:
+            primary_payload["remote_delivery_state"] = "queued_remote"
+            primary_payload["bridge_deliveries"] = bridge_deliveries
         if len(deliveries) == 1:
             attachments = base_payload.get("attachments") if isinstance(base_payload, dict) else None
             if attachments is not None:
