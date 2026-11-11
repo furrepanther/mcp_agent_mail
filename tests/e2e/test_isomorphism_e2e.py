@@ -95,6 +95,7 @@ async def _measure_file_reservation_commit_delta(
     *,
     project_key: str,
     agent_name: str,
+    registration_token: str,
 ) -> int:
     """Return number of archive commits added after a file_reservation_paths call."""
     settings = get_settings()
@@ -107,6 +108,7 @@ async def _measure_file_reservation_commit_delta(
             {
                 "project_key": project_key,
                 "agent_name": agent_name,
+                "registration_token": registration_token,
                 "paths": ["src/a.py", "src/b.py"],
                 "ttl_seconds": 3600,
                 "exclusive": True,
@@ -122,6 +124,28 @@ def _iso_at(base: datetime, *, offset_seconds: int) -> str:
     if ts.tzinfo is None or ts.tzinfo.utcoffset(ts) is None:
         ts = ts.replace(tzinfo=timezone.utc)
     return ts.isoformat()
+
+
+def _runtime_timestamp_replacements(payload: Any) -> list[tuple[str, str]]:
+    """Normalize timestamps that must remain immutable in the live model."""
+
+    today_prefix = datetime.now(timezone.utc).date().isoformat() + "T"
+    values: set[str] = set()
+
+    def collect(value: Any) -> None:
+        if isinstance(value, dict):
+            for item in value.values():
+                collect(item)
+            return
+        if isinstance(value, list):
+            for item in value:
+                collect(item)
+            return
+        if isinstance(value, str) and value.startswith(today_prefix):
+            values.add(value)
+
+    collect(payload)
+    return [(value, "<runtime_timestamp>") for value in sorted(values)]
 
 
 def _scrub_commit_meta(payload: dict[str, Any]) -> None:
@@ -193,8 +217,14 @@ async def _stabilize_timestamps(base: datetime) -> None:
         rows = await session.execute(text("SELECT id FROM messages ORDER BY id"))
         for row in rows.fetchall():
             ts = base + timedelta(seconds=200 + int(row[0]))
+            # Current messages carry immutable attestation/provenance.  The
+            # test may normalize only legacy rows; rewriting an attested row
+            # would correctly violate the production immutability trigger.
             await session.execute(
-                text("UPDATE messages SET created_ts = :ts WHERE id = :id"),
+                text(
+                    "UPDATE messages SET created_ts = :ts "
+                    "WHERE id = :id AND COALESCE(attestation_version, 0) = 0"
+                ),
                 {"ts": ts, "id": row[0]},
             )
 
@@ -264,6 +294,7 @@ def _touch_bundle_files(bundle_root: Path, base: float) -> None:
 async def test_isomorphism_e2e_suite(isolated_env, tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("WORKTREES_ENABLED", "1")
     monkeypatch.setenv("INLINE_IMAGE_MAX_BYTES", "1024")
+    monkeypatch.setenv("ALLOW_ABSOLUTE_ATTACHMENT_PATHS", "true")
     monkeypatch.setenv("LLM_ENABLED", "false")
     monkeypatch.setenv("MESSAGING_AUTO_HANDSHAKE_ON_BLOCK", "false")
     monkeypatch.setenv("TOOLS_LOG_ENABLED", "false")
@@ -290,15 +321,31 @@ async def test_isomorphism_e2e_suite(isolated_env, tmp_path: Path, monkeypatch) 
 
         agents_alpha = ["BlueLake", "RedStone", "GreenCastle", "StormyCanyon"]
         agents_beta = ["PurpleBear", "JadePond", "BlueLake"]
+        alpha_registration_tokens: dict[str, str] = {}
+        beta_registration_tokens: dict[str, str] = {}
         for name in agents_alpha:
-            await client.call_tool(
+            registration = await client.call_tool(
                 "register_agent",
                 {"project_key": alpha_key, "program": "codex", "model": "gpt-5", "name": name},
             )
+            alpha_registration_tokens[name] = _tool_data(registration)["registration_token"]
         for name in agents_beta:
-            await client.call_tool(
+            registration = await client.call_tool(
                 "register_agent",
                 {"project_key": beta_key, "program": "codex", "model": "gpt-5", "name": name},
+            )
+            beta_registration_tokens[name] = _tool_data(registration)["registration_token"]
+        # This scenario disables automatic handshakes below, so establish the
+        # same-project contacts explicitly before exercising the messaging path.
+        for name in agents_alpha[1:]:
+            await client.call_tool(
+                "macro_contact_handshake",
+                {
+                    "project_key": alpha_key,
+                    "requester": "BlueLake",
+                    "target": name,
+                    "auto_accept": True,
+                },
             )
         await client.call_tool(
             "set_contact_policy",
@@ -462,6 +509,7 @@ async def test_isomorphism_e2e_suite(isolated_env, tmp_path: Path, monkeypatch) 
             server,
             project_key=perf_key,
             agent_name=perf_agent_name,
+            registration_token=perf_agent["registration_token"],
         )
         assert commit_delta == 1, f"Expected 1 commit, got {commit_delta}"
 
@@ -595,13 +643,22 @@ async def test_isomorphism_e2e_suite(isolated_env, tmp_path: Path, monkeypatch) 
             await client.read_resource(f"resource://project/{beta_key}")
         )
         message_resource = _parse_resource_json(
-            await client.read_resource(f"resource://message/{message_id}?project={alpha_key}")
+            await client.read_resource(
+                f"resource://message/{message_id}?project={alpha_key}&agent=BlueLake"
+                f"&agent_token={alpha_registration_tokens['BlueLake']}"
+            )
         )
         followup_resource = _parse_resource_json(
-            await client.read_resource(f"resource://message/{followup_id}?project={alpha_key}")
+            await client.read_resource(
+                f"resource://message/{followup_id}?project={alpha_key}&agent=BlueLake"
+                f"&agent_token={alpha_registration_tokens['BlueLake']}"
+            )
         )
         beta_message_resource = _parse_resource_json(
-            await client.read_resource(f"resource://message/{beta_message_id}?project={beta_key}")
+            await client.read_resource(
+                f"resource://message/{beta_message_id}?project={beta_key}&agent=BlueLake"
+                f"&agent_token={beta_registration_tokens['BlueLake']}"
+            )
         )
 
         inbox_since_ts = (base_time + timedelta(seconds=200 + followup_id - 1)).isoformat()
@@ -918,6 +975,9 @@ async def test_isomorphism_e2e_suite(isolated_env, tmp_path: Path, monkeypatch) 
             "preview_status": preview_status,
         },
     }
+    if isinstance(preview_status, dict) and "signature" in preview_status:
+        preview_status["signature"] = "<manifest_signature>"
+    replacements.extend(_runtime_timestamp_replacements(result))
 
     update = os.getenv("E2E_UPDATE", "") == "1"
     assert_matches_golden(

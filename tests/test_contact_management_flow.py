@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import pytest
 from fastmcp import Client
+from fastmcp.exceptions import ToolError
 from sqlalchemy import text
 
 from mcp_agent_mail.app import build_mcp_server
@@ -76,6 +77,46 @@ async def get_agent_policy(project_id: int, agent_name: str) -> str | None:
         )
         row = result.first()
         return row[0] if row else None
+
+
+@pytest.mark.asyncio
+async def test_cross_project_auto_accept_requires_target_approval_token(isolated_env):
+    """Cross-project auto-accept must not silently omit the target token."""
+    server = build_mcp_server()
+    async with Client(server) as client:
+        await client.call_tool("ensure_project", {"human_key": "/home/datacube"})
+        await client.call_tool("ensure_project", {"human_key": "/home/primus"})
+        source = await client.call_tool(
+            "register_agent",
+            {
+                "project_key": "/home/datacube",
+                "program": "codex",
+                "model": "local-27b",
+                "name": "GreenCastle",
+            },
+        )
+        await client.call_tool(
+            "register_agent",
+            {
+                "project_key": "/home/primus",
+                "program": "codex",
+                "model": "local-27b",
+                "name": "RoseStone",
+            },
+        )
+
+        with pytest.raises(ToolError, match="target_registration_token"):
+            await client.call_tool(
+                "macro_contact_handshake",
+                {
+                    "project_key": "/home/datacube",
+                    "requester": "GreenCastle",
+                    "target": "RoseStone",
+                    "to_project": "/home/primus",
+                    "requester_registration_token": source.data["registration_token"],
+                    "auto_accept": True,
+                },
+            )
 
 
 async def get_agent_id(project_key: str, agent_name: str) -> int | None:

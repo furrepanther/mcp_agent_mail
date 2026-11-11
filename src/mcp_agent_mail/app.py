@@ -2285,6 +2285,53 @@ def _bridge_outbound_peer_token(host_key: str) -> str:
     return ""
 
 
+def _bridge_canonical_agent_name(host_key: str) -> str:
+    """Return the configured canonical remote agent for one bridge host.
+
+    Primus is the only cross-host identity with a deployment-level canonical
+    target today.  The environment variable remains an explicit override so
+    another deployment can name its peer without changing the protocol code.
+    An explicitly empty variable disables the host-specific policy for tests or
+    a deliberately different deployment; absence uses the safe Primus default.
+    """
+    normalized = re.sub(r"[^A-Za-z0-9]+", "_", host_key.strip()).strip("_").upper()
+    if normalized:
+        configured = os.getenv(f"AGENT_MAIL_BRIDGE_CANONICAL_AGENT_{normalized}")
+        if configured is not None:
+            return configured.strip()
+    if _normalize_bridge_host(host_key) == "primus":
+        return "RoseStone"
+    return ""
+
+
+def _bridge_deprecated_agent_names(host_key: str) -> set[str]:
+    """Return recipient names that must never be used by the bridge.
+
+    The default retires the historical Primus identity SwiftCat.  Operators
+    may replace the list explicitly, but the default is intentionally safe so
+    a missing environment entry cannot silently restore stale routing.
+    """
+    normalized = re.sub(r"[^A-Za-z0-9]+", "_", host_key.strip()).strip("_").upper()
+    configured = os.getenv(f"AGENT_MAIL_BRIDGE_DEPRECATED_AGENT_NAMES_{normalized}") if normalized else None
+    if configured is None:
+        configured = os.getenv("AGENT_MAIL_BRIDGE_DEPRECATED_AGENT_NAMES")
+    if configured is None:
+        configured = "SwiftCat" if _normalize_bridge_host(host_key) == "primus" else ""
+    return {item.strip().casefold() for item in configured.split(",") if item.strip()}
+
+
+def _bridge_destination_policy_error(host_key: str, agent_name: str) -> str | None:
+    normalized_agent = (agent_name or "").strip().casefold()
+    if not normalized_agent:
+        return "bridge recipient agent is empty"
+    if normalized_agent in _bridge_deprecated_agent_names(host_key):
+        return f"bridge recipient '{agent_name}' is retired; use the canonical peer identity"
+    canonical = _bridge_canonical_agent_name(host_key)
+    if canonical and normalized_agent != canonical.casefold():
+        return f"bridge recipient '{agent_name}' is not canonical for {host_key}; use '{canonical}'"
+    return None
+
+
 def _parse_mcp_tool_payload(raw_text: str) -> Any:
     raw = str(raw_text or "").strip()
     if not raw:
@@ -4557,6 +4604,56 @@ async def _flush_bridge_deliveries_once(
                 results.append({**_bridge_delivery_dict(current), "transport_state": "blocked"})
                 processed += 1
                 continue
+            destination_policy_error = _bridge_destination_policy_error(current.dest_host, current.dest_agent)
+            if destination_policy_error:
+                blocked_error = destination_policy_error
+                if current.status == "blocked" and current.last_error == blocked_error:
+                    continue
+                current.status = "blocked"
+                current.last_error = blocked_error
+                current.updated_ts = now
+                session.add(current)
+                await session.commit()
+                results.append({**_bridge_delivery_dict(current), "transport_state": "blocked"})
+                processed += 1
+                continue
+            if not peer.auth_token_hash:
+                blocked_error = "bridge peer authentication is not configured"
+                if current.status == "blocked" and current.last_error == blocked_error:
+                    continue
+                current.status = "blocked"
+                current.last_error = blocked_error
+                current.updated_ts = now
+                session.add(current)
+                await session.commit()
+                results.append({**_bridge_delivery_dict(current), "transport_state": "blocked"})
+                processed += 1
+                continue
+            peer_token = _bridge_outbound_peer_token(peer.host_key)
+            if not peer_token:
+                blocked_error = "bridge peer outbound token is not available"
+                if current.status == "blocked" and current.last_error == blocked_error:
+                    continue
+                current.status = "blocked"
+                current.last_error = blocked_error
+                current.updated_ts = now
+                session.add(current)
+                await session.commit()
+                results.append({**_bridge_delivery_dict(current), "transport_state": "blocked"})
+                processed += 1
+                continue
+            if not hmac.compare_digest(_hash_bridge_token(peer_token), peer.auth_token_hash):
+                blocked_error = "bridge peer outbound token does not match configured peer credential"
+                if current.status == "blocked" and current.last_error == blocked_error:
+                    continue
+                current.status = "blocked"
+                current.last_error = blocked_error
+                current.updated_ts = now
+                session.add(current)
+                await session.commit()
+                results.append({**_bridge_delivery_dict(current), "transport_state": "blocked"})
+                processed += 1
+                continue
             if (
                 attested_delivery
                 and int(getattr(peer, "bridge_protocol_version", 0) or 0) < _ATTESTATION_VERSION
@@ -4623,7 +4720,6 @@ async def _flush_bridge_deliveries_once(
                     "supersedes_message_id": snapshot_supersedes,
                 }
             )
-        peer_token = _bridge_outbound_peer_token(peer_host_key)
         if peer_token:
             args["peer_token"] = peer_token
 
@@ -4646,10 +4742,11 @@ async def _flush_bridge_deliveries_once(
                 current = current_result.scalars().first()
                 if current is not None:
                     now = _naive_utc()
-                    current.status = "delivered"
+                    # The peer has accepted the message into its inbox, but
+                    # this is not an acknowledgement or completion receipt.
+                    current.status = "remote_received"
                     current.remote_message_id = remote_message_id or current.remote_message_id
                     current.delivered_ts = current.delivered_ts or now
-                    current.completed_ts = current.completed_ts or now
                     current.last_error = ""
                     current.updated_ts = now
                     session.add(current)
@@ -4658,7 +4755,7 @@ async def _flush_bridge_deliveries_once(
                     result_payload = _bridge_delivery_dict(current)
                 else:
                     result_payload = delivery_snapshot
-            result_payload.update({"transport_state": "delivered", "duplicate": duplicate})
+            result_payload.update({"transport_state": "remote_received", "duplicate": duplicate})
             results.append(result_payload)
         except Exception as exc:
             error_text = str(exc)[:2048]
@@ -4684,7 +4781,9 @@ async def _flush_bridge_deliveries_once(
 
     summary = {
         "processed": processed,
-        "delivered": sum(1 for item in results if item.get("transport_state") == "delivered"),
+        "remote_received": sum(1 for item in results if item.get("transport_state") == "remote_received"),
+        "delivered": 0,
+        "completed": sum(1 for item in results if item.get("transport_state") == "completed"),
         "blocked": sum(1 for item in results if item.get("transport_state") == "blocked"),
         "retry": sum(1 for item in results if item.get("transport_state") == "retry"),
         "failed": sum(1 for item in results if item.get("transport_state") == "failed"),
@@ -6433,7 +6532,7 @@ def build_mcp_server() -> FastMCP:
                 c = Console()
                 c.print(Panel(f"project=[bold]{project.human_key}[/]\nname=[bold]{name or '(generated)'}[/]\nprogram={program}\nmodel={model}", title="tool: register_agent", border_style="green"))
             except Exception:
-                pass
+                logger.warning("Unable to infer macro contact handshake identities", exc_info=True)
         # sanitize attachments policy
         ap = (attachments_policy or "auto").lower()
         if ap not in {"auto", "inline", "file"}:
@@ -7934,6 +8033,7 @@ def build_mcp_server() -> FastMCP:
                     "Call macro_contact_handshake(project_key, requester, target, auto_accept=true) to automate",
                 ]
                 attempted: list[str] = []
+                approval_failures: dict[str, dict[str, Any]] = {}
                 # Respect explicit flag or server default ergonomics
                 effective_auto_contact: bool = bool(auto_contact_if_blocked or getattr(settings_local, "messaging_auto_handshake_on_block", True))
                 if effective_auto_contact:
@@ -7956,6 +8056,13 @@ def build_mcp_server() -> FastMCP:
                                     }
                                 )
                                 attempted.append(nm)
+                            except ToolExecutionError as exc:
+                                if exc.error_type == "TARGET_APPROVAL_REQUIRED":
+                                    approval_failures[nm] = {
+                                        "error_type": exc.error_type,
+                                        "message": str(exc),
+                                    }
+                                logger.warning("Failed to run auto-handshake for recipient %r: %s", nm, exc)
                             except Exception:
                                 logger.exception("Failed to run auto-handshake for recipient %r", nm)
 
@@ -7991,7 +8098,7 @@ def build_mcp_server() -> FastMCP:
                     except Exception:
                         logger.exception("Failed to run auto-handshakes or re-evaluate contacts after approval attempts")
                 if blocked_recipients:
-                    err_type: str = "CONTACT_REQUIRED"
+                    err_type: str = "CONTACT_APPROVAL_REQUIRED" if approval_failures else "CONTACT_REQUIRED"
                     blocked_sorted = sorted(set(blocked_recipients))
                     recipient_list = ", ".join(blocked_sorted)
                     sample_target = blocked_sorted[0]
@@ -8013,11 +8120,16 @@ def build_mcp_server() -> FastMCP:
                         err_msg_parts.append(
                             f"Automatic handshake attempts already ran for: {', '.join(attempted)}; wait for approval or retry the suggested calls explicitly."
                         )
+                    if approval_failures:
+                        err_msg_parts.append(
+                            "Automatic approval could not complete because the target registration token was not supplied."
+                        )
                     err_msg: str = " ".join(err_msg_parts)
                     err_data: dict[str, Any] = {
                         "recipients_blocked": sorted(set(blocked_recipients)),
                         "remedies": remedies,
                         "auto_contact_attempted": attempted,
+                        "approval_failures": approval_failures,
                     }
                     # Provide actionable sample calls
                     try:
@@ -8718,6 +8830,20 @@ def build_mcp_server() -> FastMCP:
                 "source_host and source_agent are required.",
                 recoverable=True,
             )
+        if not source_project_key:
+            raise ToolExecutionError(
+                "BRIDGE_PROJECT_REQUIRED",
+                "source_project_key is required for every bridged message; refusing ambiguous provenance.",
+                recoverable=True,
+                data={"source_host": source_host, "source_agent": source_agent},
+            )
+        if not bridge_dedupe_id and not external_message_id:
+            raise ToolExecutionError(
+                "BRIDGE_DEDUPE_REQUIRED",
+                "bridge_dedupe_id or external_message_id is required for retry-safe bridge delivery.",
+                recoverable=True,
+                data={"source_host": source_host, "source_agent": source_agent},
+            )
         (
             normalized_attestation_version,
             normalized_digest,
@@ -8757,14 +8883,21 @@ def build_mcp_server() -> FastMCP:
                 select(AgentMailPeer).where(func.lower(AgentMailPeer.host_key) == source_host.lower())
             )
             peer = peer_result.scalars().first()
-            if (
-                peer is not None
-                and peer.auth_token_hash
-                and (
-                    not peer_token
-                    or not hmac.compare_digest(_hash_bridge_token(peer_token), peer.auth_token_hash)
+            if peer is None or not peer.enabled:
+                raise ToolExecutionError(
+                    "BRIDGE_PEER_NOT_CONFIGURED",
+                    f"Bridge peer '{source_host}' is not configured and enabled.",
+                    recoverable=True,
+                    data={"source_host": source_host},
                 )
-            ):
+            if not peer.auth_token_hash:
+                raise ToolExecutionError(
+                    "BRIDGE_PEER_AUTH_NOT_CONFIGURED",
+                    f"Bridge peer '{source_host}' has no authentication credential configured.",
+                    recoverable=True,
+                    data={"source_host": source_host},
+                )
+            if not peer_token or not hmac.compare_digest(_hash_bridge_token(peer_token), peer.auth_token_hash):
                 raise ToolExecutionError(
                     "AUTHENTICATION_REQUIRED",
                     "Invalid or missing peer_token for bridge_receive_message.",
@@ -8977,6 +9110,7 @@ def build_mcp_server() -> FastMCP:
                 "bcc": [],
             }
         )
+        notification_errors: list[str] = []
         if settings.notifications.enabled:
             message_meta = {
                 "id": message.id,
@@ -8986,8 +9120,19 @@ def build_mcp_server() -> FastMCP:
                 "source_host": source_host,
             }
             for agent in recipient_map.values():
-                with suppress(Exception):
+                try:
                     await emit_notification_signal(settings, project.slug, agent.name, message_meta)
+                except Exception as exc:
+                    error_text = f"{type(exc).__name__}: {str(exc)[:300]}"
+                    notification_errors.append(f"{agent.name}: {error_text}")
+                    logger.warning(
+                        "Bridge message %s was stored but notification failed for %s: %s",
+                        message.id,
+                        agent.name,
+                        error_text,
+                    )
+        if notification_errors:
+            payload["notification_errors"] = notification_errors
         _schedule_memory_fabric_mail_mirror(
             settings,
             project,
@@ -9004,7 +9149,7 @@ def build_mcp_server() -> FastMCP:
                 delivery = delivery_result.scalars().first()
                 if delivery is not None:
                     delivery.remote_message_id = str(message.id)
-                    delivery.status = "delivered"
+                    delivery.status = "remote_received"
                     delivery.delivered_ts = _naive_utc()
                     delivery.updated_ts = _naive_utc()
                     session.add(delivery)
@@ -9060,7 +9205,7 @@ def build_mcp_server() -> FastMCP:
         await ctx.info(
             "Bridge transport flush processed "
             f"{summary['processed']} deliveries "
-            f"({summary['delivered']} delivered, {summary['blocked']} blocked, "
+            f"({summary['remote_received']} remote_received, {summary['blocked']} blocked, "
             f"{summary['retry']} retry, {summary['failed']} failed)."
         )
         return summary
@@ -10505,6 +10650,21 @@ def build_mcp_server() -> FastMCP:
                 },
             )
 
+        if auto_accept and target_project_key and not target_registration_token:
+            raise ToolExecutionError(
+                "TARGET_APPROVAL_REQUIRED",
+                (
+                    f"Target agent '{real_target}' in project '{target_project_key}' must provide its "
+                    "target_registration_token before cross-project contact can be approved."
+                ),
+                recoverable=True,
+                data={
+                    "target": real_target,
+                    "target_project": target_project_key,
+                    "token_param": "target_registration_token",
+                },
+            )
+
         # Fast path: for same-project auto-accept handshakes (used heavily by send_message),
         # approve the AgentLink directly without generating extra "intro" messages.
         if auto_accept and not target_project_key and not (welcome_subject and welcome_body):
@@ -10527,9 +10687,26 @@ def build_mcp_server() -> FastMCP:
                     action="macro_contact_handshake target approval",
                 )
             except (NoResultFound, ToolExecutionError) as exc:
-                is_not_found = isinstance(exc, NoResultFound) or (
-                    isinstance(exc, ToolExecutionError) and exc.error_type == "NOT_FOUND"
-                )
+                if isinstance(exc, ToolExecutionError):
+                    if exc.error_type == "AUTHENTICATION_REQUIRED":
+                        raise ToolExecutionError(
+                            "TARGET_APPROVAL_REQUIRED",
+                            (
+                                f"Target agent '{real_target}' must provide target_registration_token before "
+                                "auto-accept can approve contact."
+                            ),
+                            recoverable=True,
+                            data={
+                                "target": real_target,
+                                "target_project": project.human_key,
+                                "token_param": "target_registration_token",
+                            },
+                        ) from exc
+                    if exc.error_type != "NOT_FOUND":
+                        raise
+                    is_not_found = True
+                else:
+                    is_not_found = True
                 if is_not_found and register_if_missing and validate_agent_name_format(real_target):
                     settings = get_settings()
                     b = await _get_or_create_agent(
@@ -10660,6 +10837,7 @@ def build_mcp_server() -> FastMCP:
             response_result = cast(dict[str, Any], respond_tool_result.structured_content or {})
 
         welcome_result = None
+        welcome_error = None
         if welcome_subject and welcome_body and not target_project_key:
             try:
                 send_tool = cast(FunctionTool, cast(Any, send_message))
@@ -10677,14 +10855,20 @@ def build_mcp_server() -> FastMCP:
                     }
                 )
                 welcome_result = cast(dict[str, Any], send_tool_result.structured_content or {})
-            except ToolExecutionError as exc:
-                # surface but do not abort handshake
-                await ctx.debug(f"macro_contact_handshake failed to send welcome: {exc}")
+            except Exception as exc:
+                # A contact handshake may succeed while its optional welcome
+                # fails, but that partial failure must remain machine-visible.
+                logger.warning("macro_contact_handshake welcome delivery failed", exc_info=True)
+                welcome_error = {
+                    "error_type": getattr(exc, "error_type", type(exc).__name__),
+                    "message": str(exc)[:2048],
+                }
 
         return {
             "request": request_result,
             "response": response_result,
             "welcome_message": welcome_result,
+            "welcome_error": welcome_error,
         }
 
     @mcp.tool(name="search_messages")

@@ -161,6 +161,7 @@ class ScrubSummary:
     attachments_sanitized: int
     bodies_redacted: int
     attachments_cleared: int
+    attestations_removed: int = 0
 
 
 @dataclass(slots=True, frozen=True)
@@ -810,6 +811,69 @@ def _scrub_structure(value: Any) -> tuple[Any, int, int]:
     return value, 0, 0
 
 
+_MESSAGE_ATTESTATION_TRIGGERS = (
+    "messages_legacy_attestation_immutable",
+    "messages_attested_immutable",
+)
+
+
+def _detach_snapshot_attestations(conn: sqlite3.Connection) -> tuple[int, list[tuple[str, str]]]:
+    """Detach attestation metadata before mutating attested export rows.
+
+    A share snapshot is a derived, potentially redacted copy rather than the
+    source of truth. Once its message content, attachments, or acknowledgement
+    state is transformed, the source attestation no longer describes the row.
+    Keep the production append-only triggers intact while making that explicit
+    in the copy by converting affected rows to legacy/unattested history.
+    """
+
+    trigger_rows = conn.execute(
+        "SELECT name, sql FROM sqlite_master "
+        "WHERE type = 'trigger' AND name IN (?, ?) ORDER BY name",
+        _MESSAGE_ATTESTATION_TRIGGERS,
+    ).fetchall()
+    trigger_definitions = [(str(row[0]), str(row[1])) for row in trigger_rows if row[1]]
+    try:
+        attested_count = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM messages WHERE attestation_version >= 1"
+            ).fetchone()[0]
+        )
+    except sqlite3.OperationalError:
+        # Older exported snapshots predate message attestations. They remain
+        # compatible with the existing scrub pipeline and need no transition.
+        return 0, trigger_definitions
+    if not attested_count:
+        return 0, trigger_definitions
+
+    for name, _sql in trigger_definitions:
+        conn.execute(f'DROP TRIGGER "{name}"')
+    conn.execute(
+        """
+        UPDATE messages
+        SET body_sha256 = NULL,
+            attestation_version = 0,
+            revision = 0,
+            supersedes_message_id = NULL,
+            bridge_dedupe_scope = NULL,
+            bridge_revision_scope = NULL
+        WHERE attestation_version >= 1
+        """
+    )
+    return attested_count, trigger_definitions
+
+
+def _restore_snapshot_attestation_triggers(
+    conn: sqlite3.Connection,
+    trigger_definitions: Sequence[tuple[str, str]],
+) -> None:
+    """Restore the exact trigger definitions captured from the snapshot."""
+
+    for name, sql in trigger_definitions:
+        conn.execute(f'DROP TRIGGER IF EXISTS "{name}"')
+        conn.execute(sql)
+
+
 def scrub_snapshot(
     snapshot_path: Path,
     *,
@@ -828,11 +892,24 @@ def scrub_snapshot(
 
     bodies_redacted = 0
     attachments_cleared = 0
+    attestations_removed = 0
 
     conn = sqlite3.connect(str(snapshot_path))
+    trigger_definitions: list[tuple[str, str]] = []
+    triggers_detached = False
     try:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=ON")
+
+        message_rows_need_mutation = bool(
+            clear_ack_state
+            or scrub_secrets
+            or bool(preset_opts.get("redact_body"))
+            or bool(preset_opts.get("drop_attachments"))
+        )
+        if message_rows_need_mutation:
+            attestations_removed, trigger_definitions = _detach_snapshot_attestations(conn)
+            triggers_detached = bool(trigger_definitions and attestations_removed)
 
         # Agent names are already meaningless pseudonyms in our system.
         # Do not rewrite or scrub agent names.
@@ -934,7 +1011,16 @@ def scrub_snapshot(
             if attachments_updated or attachment_replacements or attachment_keys_removed:
                 attachments_sanitized += 1
 
+        if triggers_detached:
+            _restore_snapshot_attestation_triggers(conn, trigger_definitions)
+            triggers_detached = False
         conn.commit()
+    except Exception:
+        conn.rollback()
+        if triggers_detached:
+            _restore_snapshot_attestation_triggers(conn, trigger_definitions)
+            conn.commit()
+        raise
     finally:
         conn.close()
 
@@ -951,6 +1037,7 @@ def scrub_snapshot(
         attachments_sanitized=attachments_sanitized,
         bodies_redacted=bodies_redacted,
         attachments_cleared=attachments_cleared,
+        attestations_removed=attestations_removed,
     )
 
 

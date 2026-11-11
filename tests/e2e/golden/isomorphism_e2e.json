@@ -2,19 +2,56 @@
   "contacts": {
     "approve_contact": {
       "approved": true,
-      "expires_ts": "2025-01-01T00:15:52+00:00",
+      "expires_ts": "2025-01-01T00:15:53+00:00",
       "from": "BlueLake",
       "to": "PurpleBear",
       "updated": 1
     },
     "cross_send": {
-      "attachments": [],
-      "count": 1,
+      "bridge_deliveries": [
+        {
+          "ack_ts": null,
+          "attempts": 0,
+          "attestation": {
+            "body_sha256": "fc862945fff79c3ea3a8527b06da09f791c6c33cc38ca4ae74152c6f38f05e46",
+            "revision": 1,
+            "status": "attested",
+            "supersedes_message_id": null,
+            "version": 1
+          },
+          "bridge_id": "ce27a2098759f8aa4450a882d703e702",
+          "completed_ts": null,
+          "created_ts": "<runtime_timestamp>",
+          "delivered_ts": null,
+          "dest_agent": "PurpleBear",
+          "dest_host": "beta",
+          "dest_project_key": "",
+          "id": 1,
+          "last_error": "",
+          "local_message_id": 6,
+          "read_ts": null,
+          "remote_message_id": null,
+          "source_agent": "BlueLake",
+          "source_host": "Datacube",
+          "source_project_key": "/alpha",
+          "status": "queued",
+          "updated_ts": "<runtime_timestamp>"
+        }
+      ],
+      "count": 2,
       "deliveries": [
         {
+          "bridge_audit": true,
           "payload": {
             "ack_required": false,
             "attachments": [],
+            "attestation": {
+              "body_sha256": "fc862945fff79c3ea3a8527b06da09f791c6c33cc38ca4ae74152c6f38f05e46",
+              "revision": 1,
+              "status": "attested",
+              "supersedes_message_id": null,
+              "version": 1
+            },
             "bcc": [],
             "body_md": "approved path",
             "cc": [],
@@ -22,22 +59,60 @@
             "from": "BlueLake",
             "id": 6,
             "importance": "normal",
-            "project_id": 2,
-            "sender_id": 7,
+            "project_id": 1,
+            "remote_recipients": [
+              {
+                "agent_name": "PurpleBear",
+                "host_key": "beta",
+                "input": "PurpleBear@beta",
+                "kind": "to"
+              }
+            ],
+            "sender_id": 1,
             "subject": "Cross Project",
             "thread_id": null,
-            "to": [
-              "PurpleBear"
-            ]
+            "to": [],
+            "topic": null
           },
-          "project": "/beta"
+          "project": "/alpha"
+        },
+        {
+          "delivery_state": "queued_remote",
+          "payload": {
+            "ack_ts": null,
+            "attempts": 0,
+            "attestation": {
+              "body_sha256": "fc862945fff79c3ea3a8527b06da09f791c6c33cc38ca4ae74152c6f38f05e46",
+              "revision": 1,
+              "status": "attested",
+              "supersedes_message_id": null,
+              "version": 1
+            },
+            "bridge_id": "ce27a2098759f8aa4450a882d703e702",
+            "completed_ts": null,
+            "created_ts": "<runtime_timestamp>",
+            "delivered_ts": null,
+            "dest_agent": "PurpleBear",
+            "dest_host": "beta",
+            "dest_project_key": "",
+            "id": 1,
+            "last_error": "",
+            "local_message_id": 6,
+            "read_ts": null,
+            "remote_message_id": null,
+            "source_agent": "BlueLake",
+            "source_host": "Datacube",
+            "source_project_key": "/alpha",
+            "status": "queued",
+            "updated_ts": "<runtime_timestamp>"
+          },
+          "project": "PurpleBear@beta"
         }
-      ]
+      ],
+      "remote_delivery_state": "queued_remote",
+      "verified_sender": true
     },
-    "denied_error": {
-      "error_type": "ToolError",
-      "message": "Error calling tool 'send_message': Unable to send message \u2014 external recipients missing approved contact links: JadePond @ /beta; Use resource://agents/alpha to list registered agents or register new identities."
-    },
+    "denied_error": {},
     "deny_contact": {
       "approved": false,
       "expires_ts": null,
@@ -46,7 +121,7 @@
       "updated": 1
     },
     "deny_request": {
-      "expires_ts": "2025-01-01T00:15:51+00:00",
+      "expires_ts": "2025-01-01T00:15:52+00:00",
       "from": "BlueLake",
       "from_project": "/alpha",
       "status": "pending",
@@ -56,21 +131,42 @@
     "list_contacts": [
       {
         "expires_ts": "2025-01-01T00:15:51+00:00",
-        "reason": "deny-case",
-        "status": "blocked",
-        "to": "JadePond",
+        "reason": "",
+        "status": "approved",
+        "to": "GreenCastle",
         "updated_ts": "2025-01-01T00:15:01+00:00"
       },
       {
         "expires_ts": "2025-01-01T00:15:52+00:00",
+        "reason": "deny-case",
+        "status": "blocked",
+        "to": "JadePond",
+        "updated_ts": "2025-01-01T00:15:02+00:00"
+      },
+      {
+        "expires_ts": "2025-01-01T00:15:53+00:00",
         "reason": "e2e",
         "status": "approved",
         "to": "PurpleBear",
-        "updated_ts": "2025-01-01T00:15:02+00:00"
+        "updated_ts": "2025-01-01T00:15:03+00:00"
+      },
+      {
+        "expires_ts": "2025-01-01T00:15:54+00:00",
+        "reason": "",
+        "status": "approved",
+        "to": "RedStone",
+        "updated_ts": "2025-01-01T00:15:04+00:00"
+      },
+      {
+        "expires_ts": "2025-01-01T00:15:55+00:00",
+        "reason": "",
+        "status": "approved",
+        "to": "StormyCanyon",
+        "updated_ts": "2025-01-01T00:15:05+00:00"
       }
     ],
     "request_contact": {
-      "expires_ts": "2025-01-01T00:15:52+00:00",
+      "expires_ts": "2025-01-01T00:15:53+00:00",
       "from": "BlueLake",
       "from_project": "/alpha",
       "status": "pending",
@@ -137,14 +233,14 @@
         "last_agent_activity_ts": "2025-01-01T00:02:01+00:00",
         "last_filesystem_activity_ts": null,
         "last_git_activity_ts": null,
-        "last_mail_activity_ts": "2025-01-01T00:03:22+00:00",
+        "last_mail_activity_ts": "<runtime_timestamp>",
         "path_pattern": "src/core.py",
         "reason": "e2e",
         "released_ts": "2025-01-01T00:11:41+00:00",
         "stale": false,
         "stale_reasons": [
           "agent_inactive>1800s",
-          "no_recent_mail_activity>900s",
+          "mail_activity_recent",
           "path_pattern_unmatched"
         ]
       },
@@ -357,8 +453,15 @@
             "width": 128
           }
         ],
+        "attestation": {
+          "body_sha256": "3392c346c694cf58464180c702d1cb4ec350829dabbb1f2d29ccd697701f5a7c",
+          "revision": 1,
+          "status": "attested",
+          "supersedes_message_id": null,
+          "version": 1
+        },
         "body_md": "Launch kickoff\n\n![inline](data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII=)\n",
-        "created_ts": "2025-01-01T00:03:21+00:00",
+        "created_ts": "<runtime_timestamp>",
         "from": "BlueLake",
         "id": 1,
         "importance": "normal",
@@ -366,13 +469,21 @@
         "project_id": 1,
         "sender_id": 1,
         "subject": "Launch Plan",
-        "thread_id": "THREAD-1"
+        "thread_id": "THREAD-1",
+        "topic": null
       },
       {
         "ack_required": false,
         "attachments": [],
+        "attestation": {
+          "body_sha256": "8a05d14b3a6c3152b9931f7f6c6dacb4341b14b47076e38085d1fc7ffe051095",
+          "revision": 1,
+          "status": "attested",
+          "supersedes_message_id": null,
+          "version": 1
+        },
         "body_md": "Follow up details",
-        "created_ts": "2025-01-01T00:03:22+00:00",
+        "created_ts": "<runtime_timestamp>",
         "from": "BlueLake",
         "id": 2,
         "importance": "normal",
@@ -380,7 +491,8 @@
         "project_id": 1,
         "sender_id": 1,
         "subject": "Follow Up",
-        "thread_id": "THREAD-1"
+        "thread_id": "THREAD-1",
+        "topic": null
       }
     ],
     "fetch_inbox_since": "2025-01-01T00:03:21",
@@ -414,11 +526,18 @@
               "width": 128
             }
           ],
+          "attestation": {
+            "body_sha256": "3392c346c694cf58464180c702d1cb4ec350829dabbb1f2d29ccd697701f5a7c",
+            "revision": 1,
+            "status": "attested",
+            "supersedes_message_id": null,
+            "version": 1
+          },
           "commit": {
             "hexsha": "<commit_hexsha>",
             "summary": "\u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550 \u2705 MCP TOOL CALL COMPLETED \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557"
           },
-          "created_ts": "2025-01-01T00:03:21+00:00",
+          "created_ts": "<runtime_timestamp>",
           "from": "BlueLake",
           "id": 1,
           "importance": "normal",
@@ -426,16 +545,24 @@
           "project_id": 1,
           "sender_id": 1,
           "subject": "Launch Plan",
-          "thread_id": "THREAD-1"
+          "thread_id": "THREAD-1",
+          "topic": null
         },
         {
           "ack_required": false,
           "attachments": [],
+          "attestation": {
+            "body_sha256": "8a05d14b3a6c3152b9931f7f6c6dacb4341b14b47076e38085d1fc7ffe051095",
+            "revision": 1,
+            "status": "attested",
+            "supersedes_message_id": null,
+            "version": 1
+          },
           "commit": {
             "hexsha": "<commit_hexsha>",
             "summary": "\u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550 \u2705 MCP TOOL CALL COMPLETED \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557"
           },
-          "created_ts": "2025-01-01T00:03:22+00:00",
+          "created_ts": "<runtime_timestamp>",
           "from": "BlueLake",
           "id": 2,
           "importance": "normal",
@@ -443,14 +570,15 @@
           "project_id": 1,
           "sender_id": 1,
           "subject": "Follow Up",
-          "thread_id": "THREAD-1"
+          "thread_id": "THREAD-1",
+          "topic": null
         }
       ],
       "project": "/alpha"
     },
     "outbox": {
       "agent": "BlueLake",
-      "count": 2,
+      "count": 4,
       "messages": [
         {
           "ack_required": true,
@@ -478,13 +606,44 @@
               "width": 128
             }
           ],
+          "attestation": {
+            "body_sha256": "3392c346c694cf58464180c702d1cb4ec350829dabbb1f2d29ccd697701f5a7c",
+            "revision": 1,
+            "status": "attested",
+            "supersedes_message_id": null,
+            "version": 1
+          },
           "bcc": [
             "StormyCanyon"
           ],
           "cc": [
             "GreenCastle"
           ],
-          "created_ts": "2025-01-01T00:03:21+00:00",
+          "commit": {
+            "authored_ts": "<commit_authored_ts>",
+            "deletions": 0,
+            "diff_summary": {
+              "excerpt": [
+                "+---json",
+                "+{",
+                "+  \"ack_required\": true,",
+                "+  \"attachments\": [",
+                "+    {",
+                "+      \"media_type\": \"image/png\",",
+                "+      \"type\": \"inline\"",
+                "+    },",
+                "+    {",
+                "+      \"bytes\": 68,",
+                "+      \"data_base64\": \"UklGRjwAAABXRUJQVlA4IDAAAADQAQCdASoEAAQAAUAmJaACdLoB+AADsAD+8ut//NgVzXPv9//S4P0uD9Lg/9KQAAA=\",",
+                "+      \"height\": 4,"
+              ],
+              "hunks": 1
+            },
+            "hexsha": "<commit_hexsha>",
+            "insertions": 57,
+            "summary": "\u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550 \u2705 MCP TOOL CALL COMPLETED \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557"
+          },
+          "created_ts": "<runtime_timestamp>",
           "from": "BlueLake",
           "id": 1,
           "importance": "normal",
@@ -494,14 +653,46 @@
           "thread_id": "THREAD-1",
           "to": [
             "RedStone"
-          ]
+          ],
+          "topic": null
         },
         {
           "ack_required": false,
           "attachments": [],
+          "attestation": {
+            "body_sha256": "8a05d14b3a6c3152b9931f7f6c6dacb4341b14b47076e38085d1fc7ffe051095",
+            "revision": 1,
+            "status": "attested",
+            "supersedes_message_id": null,
+            "version": 1
+          },
           "bcc": [],
           "cc": [],
-          "created_ts": "2025-01-01T00:03:22+00:00",
+          "commit": {
+            "authored_ts": "<commit_authored_ts>",
+            "deletions": 0,
+            "diff_summary": {
+              "excerpt": [
+                "+---json",
+                "+{",
+                "+  \"ack_required\": false,",
+                "+  \"attachments\": [],",
+                "+  \"attestation\": {",
+                "+    \"body_sha256\": \"8a05d14b3a6c3152b9931f7f6c6dacb4341b14b47076e38085d1fc7ffe051095\",",
+                "+    \"revision\": 1,",
+                "+    \"status\": \"attested\",",
+                "+    \"supersedes_message_id\": null,",
+                "+    \"version\": 1",
+                "+  },",
+                "+  \"bcc\": [],"
+              ],
+              "hunks": 1
+            },
+            "hexsha": "<commit_hexsha>",
+            "insertions": 28,
+            "summary": "\u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550 \u2705 MCP TOOL CALL COMPLETED \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557"
+          },
+          "created_ts": "<runtime_timestamp>",
           "from": "BlueLake",
           "id": 2,
           "importance": "normal",
@@ -511,7 +702,54 @@
           "thread_id": "THREAD-1",
           "to": [
             "RedStone"
-          ]
+          ],
+          "topic": null
+        },
+        {
+          "ack_required": false,
+          "attachments": [],
+          "attestation": {
+            "body_sha256": "fc862945fff79c3ea3a8527b06da09f791c6c33cc38ca4ae74152c6f38f05e46",
+            "revision": 1,
+            "status": "attested",
+            "supersedes_message_id": null,
+            "version": 1
+          },
+          "bcc": [],
+          "cc": [],
+          "created_ts": "<runtime_timestamp>",
+          "from": "BlueLake",
+          "id": 6,
+          "importance": "normal",
+          "project_id": 1,
+          "sender_id": 1,
+          "subject": "Cross Project",
+          "thread_id": null,
+          "to": [],
+          "topic": null
+        },
+        {
+          "ack_required": false,
+          "attachments": [],
+          "attestation": {
+            "body_sha256": "db278fb3dbacdf200a65e6f4bcf72b18767b07e2efc63889b09105605b5e0e08",
+            "revision": 1,
+            "status": "attested",
+            "supersedes_message_id": null,
+            "version": 1
+          },
+          "bcc": [],
+          "cc": [],
+          "created_ts": "<runtime_timestamp>",
+          "from": "BlueLake",
+          "id": 7,
+          "importance": "normal",
+          "project_id": 1,
+          "sender_id": 1,
+          "subject": "Should Fail",
+          "thread_id": null,
+          "to": [],
+          "topic": null
         }
       ],
       "project": "/alpha"
@@ -521,28 +759,44 @@
     "beta_message": {
       "ack_required": false,
       "attachments": [],
+      "attestation": {
+        "body_sha256": "521470e2a02f6cbd9668eead198a34b6e1f8af9ed42f2ad146b8fb9d3ddbeb9e",
+        "revision": 1,
+        "status": "attested",
+        "supersedes_message_id": null,
+        "version": 1
+      },
       "body_md": "beta side",
-      "created_ts": "2025-01-01T00:03:23+00:00",
+      "created_ts": "<runtime_timestamp>",
       "from": "PurpleBear",
       "id": 3,
       "importance": "normal",
       "project_id": 2,
       "sender_id": 5,
       "subject": "Beta Hello",
-      "thread_id": "THREAD-1"
+      "thread_id": "THREAD-1",
+      "topic": null
     },
     "followup": {
       "ack_required": false,
       "attachments": [],
+      "attestation": {
+        "body_sha256": "8a05d14b3a6c3152b9931f7f6c6dacb4341b14b47076e38085d1fc7ffe051095",
+        "revision": 1,
+        "status": "attested",
+        "supersedes_message_id": null,
+        "version": 1
+      },
       "body_md": "Follow up details",
-      "created_ts": "2025-01-01T00:03:22+00:00",
+      "created_ts": "<runtime_timestamp>",
       "from": "BlueLake",
       "id": 2,
       "importance": "normal",
       "project_id": 1,
       "sender_id": 1,
       "subject": "Follow Up",
-      "thread_id": "THREAD-1"
+      "thread_id": "THREAD-1",
+      "topic": null
     },
     "message": {
       "ack_required": true,
@@ -570,15 +824,23 @@
           "width": 128
         }
       ],
+      "attestation": {
+        "body_sha256": "3392c346c694cf58464180c702d1cb4ec350829dabbb1f2d29ccd697701f5a7c",
+        "revision": 1,
+        "status": "attested",
+        "supersedes_message_id": null,
+        "version": 1
+      },
       "body_md": "Launch kickoff\n\n![inline](data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII=)\n",
-      "created_ts": "2025-01-01T00:03:21+00:00",
+      "created_ts": "<runtime_timestamp>",
       "from": "BlueLake",
       "id": 1,
       "importance": "normal",
       "project_id": 1,
       "sender_id": 1,
       "subject": "Launch Plan",
-      "thread_id": "THREAD-1"
+      "thread_id": "THREAD-1",
+      "topic": null
     }
   },
   "product_bus": {
@@ -586,8 +848,15 @@
       {
         "ack_required": false,
         "attachments": [],
+        "attestation": {
+          "body_sha256": "521470e2a02f6cbd9668eead198a34b6e1f8af9ed42f2ad146b8fb9d3ddbeb9e",
+          "revision": 1,
+          "status": "attested",
+          "supersedes_message_id": null,
+          "version": 1
+        },
         "body_md": "beta side",
-        "created_ts": "2025-01-01T00:03:23+00:00",
+        "created_ts": "<runtime_timestamp>",
         "from": "PurpleBear",
         "id": 3,
         "importance": "normal",
@@ -595,7 +864,8 @@
         "project_id": 2,
         "sender_id": 5,
         "subject": "Beta Hello",
-        "thread_id": "THREAD-1"
+        "thread_id": "THREAD-1",
+        "topic": null
       }
     ],
     "link_alpha": {
@@ -653,19 +923,19 @@
     "thread_summary": {
       "examples": [
         {
-          "created_ts": "2025-01-01T00:03:21+00:00",
+          "created_ts": "<runtime_timestamp>",
           "from": "BlueLake",
           "id": 1,
           "subject": "Launch Plan"
         },
         {
-          "created_ts": "2025-01-01T00:03:22+00:00",
+          "created_ts": "<runtime_timestamp>",
           "from": "BlueLake",
           "id": 2,
           "subject": "Follow Up"
         },
         {
-          "created_ts": "2025-01-01T00:03:23+00:00",
+          "created_ts": "<runtime_timestamp>",
           "from": "PurpleBear",
           "id": 3,
           "subject": "Beta Hello"
@@ -713,7 +983,7 @@
       "result": [
         {
           "ack_required": 1,
-          "created_ts": "2025-01-01T00:03:21+00:00",
+          "created_ts": "<runtime_timestamp>",
           "from": "BlueLake",
           "id": 1,
           "importance": "normal",
@@ -746,8 +1016,8 @@
         "meta_info": {
           "fts_enabled": false,
           "generated_at": "2025-01-01T12:00:00+00:00",
-          "message_count": 6,
-          "messages_cached": 6
+          "message_count": 7,
+          "messages_cached": 7
         }
       }
     },
@@ -758,20 +1028,21 @@
       "manifest_iso": "2024-08-30T06:40:06+00:00",
       "manifest_ns": 1725000006000000000,
       "manual_token": 0,
-      "signature": "c59d7b3c965d2d4edc9bcaa24ddc4d10f7d1cdc4fdb32912e3b1d6dfcaef0085"
+      "signature": "<manifest_signature>"
     },
     "scrub_summary": {
-      "ack_flags_cleared": 6,
-      "agent_links_removed": 2,
+      "ack_flags_cleared": 7,
+      "agent_links_removed": 5,
       "agents_pseudonymized": 0,
       "agents_total": 8,
       "attachments_cleared": 0,
       "attachments_sanitized": 0,
+      "attestations_removed": 7,
       "bodies_redacted": 0,
       "file_reservations_removed": 5,
       "preset": "standard",
       "pseudonym_salt": "standard",
-      "recipients_cleared": 8,
+      "recipients_cleared": 7,
       "secrets_replaced": 0
     },
     "summary": {
@@ -783,9 +1054,9 @@
         "total": 0
       },
       "importance": {
-        "normal": 6
+        "normal": 7
       },
-      "messages": 6,
+      "messages": 7,
       "projects": [
         {
           "human_key": "/<phase2_project>",
@@ -800,7 +1071,7 @@
           "slug": "beta"
         }
       ],
-      "threads": 4
+      "threads": 5
     },
     "verify": {
       "bundle": "<bundle_root>",

@@ -98,6 +98,12 @@ def isolated_env(tmp_path, monkeypatch):
     monkeypatch.setenv("HTTP_PORT", "8765")
     monkeypatch.setenv("HTTP_PATH", "/mcp/")
     monkeypatch.setenv("APP_ENVIRONMENT", "test")
+    # Existing fixtures exercise legacy identity names; production defaults
+    # retire SwiftCat and require RoseStone for Primus. Strict-policy tests
+    # explicitly remove these compatibility overrides.
+    monkeypatch.setenv("AGENT_MAIL_BRIDGE_CANONICAL_AGENT_PRIMUS", "")
+    monkeypatch.setenv("AGENT_MAIL_BRIDGE_DEPRECATED_AGENT_NAMES", "")
+    monkeypatch.setenv("AGENT_MAIL_BRIDGE_PEER_TOKEN_PRIMUS", "test-bridge-token")
     storage_root = tmp_path / "storage"
     monkeypatch.setenv("STORAGE_ROOT", str(storage_root))
     monkeypatch.setenv("GIT_AUTHOR_NAME", "test-agent")
