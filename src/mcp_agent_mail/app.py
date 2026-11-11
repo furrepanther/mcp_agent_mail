@@ -4380,6 +4380,27 @@ async def _queue_bridge_deliveries(
             host_key = recipient["host_key"].strip()
             agent_name = recipient["agent_name"].strip()
             dest_project_key = str(recipient.get("dest_project_key", "") or "").strip()
+            destination_policy_error = _bridge_destination_policy_error(host_key, agent_name)
+            if destination_policy_error:
+                raise ToolExecutionError(
+                    "BRIDGE_DESTINATION_POLICY",
+                    destination_policy_error,
+                    recoverable=True,
+                    data={"host_key": host_key, "agent_name": agent_name},
+                )
+            peer_result = await session.execute(
+                select(AgentMailPeer).where(func.lower(AgentMailPeer.host_key) == host_key.lower())
+            )
+            peer = peer_result.scalars().first()
+            if peer is not None and peer.enabled and not dest_project_key:
+                dest_project_key = str(peer.project_key or "").strip()
+            if peer is not None and peer.enabled and not dest_project_key:
+                raise ToolExecutionError(
+                    "BRIDGE_PROJECT_REQUIRED",
+                    f"Bridge peer '{host_key}' has no destination project_key; refusing ambiguous delivery.",
+                    recoverable=True,
+                    data={"host_key": host_key, "agent_name": agent_name},
+                )
             identity_result = await session.execute(
                 select(AgentMailRemoteIdentity).where(
                     func.lower(AgentMailRemoteIdentity.host_key) == host_key.lower(),

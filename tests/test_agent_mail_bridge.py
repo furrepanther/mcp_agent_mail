@@ -52,13 +52,14 @@ async def test_name_at_host_queues_remote_delivery(isolated_env, monkeypatch):
                 "name": "RoseStone",
             },
         )
+        await _configure_peer(client, "Primus", "/home/primus")
 
         sent = await client.call_tool(
             "send_message",
             {
                 "project_key": "/home/Antigravity",
                 "sender_name": "RoseStone",
-                "to": ["SwiftCat@Primus"],
+                "to": ["RoseStone@Primus"],
                 "subject": "Bridge smoke",
                 "body_md": "queued body",
                 "thread_id": "bridge-smoke",
@@ -70,7 +71,7 @@ async def test_name_at_host_queues_remote_delivery(isolated_env, monkeypatch):
         bridge = sent.data["bridge_deliveries"][0]
         assert bridge["source_host"] == "Datacube"
         assert bridge["dest_host"] == "Primus"
-        assert bridge["dest_agent"] == "SwiftCat"
+        assert bridge["dest_agent"] == "RoseStone"
         assert bridge["status"] == "queued"
 
         identities = await client.call_tool(
@@ -78,7 +79,7 @@ async def test_name_at_host_queues_remote_delivery(isolated_env, monkeypatch):
             {"project_key": "/home/Antigravity", "include_remote": True},
         )
         assert any(
-            item["host_key"] == "Primus" and item["agent_name"] == "SwiftCat"
+            item["host_key"] == "Primus" and item["agent_name"] == "RoseStone"
             for item in identities.data["remote"]
         )
 
@@ -1438,21 +1439,53 @@ async def test_flush_rejects_retired_and_noncanonical_primus_identity(isolated_e
             },
         )
         await _configure_peer(client, "Primus", "/home/primus")
+        with pytest.raises(ToolError, match="retired"):
+            await client.call_tool(
+                "send_message",
+                {
+                    "project_key": "/home/Antigravity",
+                    "sender_name": "GreenCastle",
+                    "to": ["SwiftCat@Primus"],
+                    "subject": "Stale identity",
+                    "body_md": "must never reach the peer",
+                },
+            )
+        deliveries = await client.call_tool("list_bridge_deliveries", {"dest_host": "Primus", "limit": 5})
+
+    assert deliveries.data == []
+    assert bridge_calls == []
+
+
+@pytest.mark.asyncio
+async def test_queue_rejects_blank_peer_project(isolated_env, monkeypatch):
+    monkeypatch.setenv("AGENT_MAIL_HOST_KEY", "Datacube")
+    server = build_mcp_server()
+    async with Client(server) as client:
+        await client.call_tool("ensure_project", {"human_key": "/home/Antigravity"})
         await client.call_tool(
-            "send_message",
+            "register_agent",
             {
                 "project_key": "/home/Antigravity",
-                "sender_name": "GreenCastle",
-                "to": ["SwiftCat@Primus"],
-                "subject": "Stale identity",
-                "body_md": "must never reach the peer",
+                "program": "codex",
+                "model": "gpt-5",
+                "name": "GreenCastle",
             },
         )
-        flushed = await client.call_tool("flush_bridge_deliveries", {"limit": 5})
+        await _configure_peer(client, "Primus", "")
+        with pytest.raises(ToolError, match="no destination project_key"):
+            await client.call_tool(
+                "send_message",
+                {
+                    "project_key": "/home/Antigravity",
+                    "sender_name": "GreenCastle",
+                    "to": ["RoseStone@Primus"],
+                    "subject": "Ambiguous project",
+                    "body_md": "must never be queued",
+                },
+            )
+        deliveries = await client.call_tool("list_bridge_deliveries", {"dest_host": "Primus", "limit": 5})
 
-    assert flushed.data["blocked"] == 1
-    assert "retired" in flushed.data["results"][0]["last_error"]
-    assert bridge_calls == []
+    assert deliveries.data == []
 
 
 @pytest.mark.asyncio
