@@ -695,6 +695,25 @@ def test_verify_viewer_vendor_assets():
     share._verify_viewer_vendor_assets()
 
 
+def test_copy_viewer_assets_excludes_interpreter_artifacts(monkeypatch, tmp_path: Path) -> None:
+    source_root = tmp_path / "source" / "mcp_agent_mail"
+    viewer_assets = source_root / "viewer_assets"
+    viewer_assets.mkdir(parents=True)
+    (viewer_assets / "index.html").write_text("<html></html>", encoding="utf-8")
+    cache_dir = viewer_assets / "__pycache__"
+    cache_dir.mkdir()
+    (cache_dir / "__init__.cpython-312.pyc").write_bytes(b"bytecode")
+    (viewer_assets / "stale.pyo").write_bytes(b"bytecode")
+
+    monkeypatch.setattr(share, "__file__", str(source_root / "share.py"))
+    output_dir = tmp_path / "bundle"
+    share.copy_viewer_assets(output_dir)
+
+    assert (output_dir / "viewer" / "index.html").is_file()
+    assert not (output_dir / "viewer" / "__pycache__").exists()
+    assert not (output_dir / "viewer" / "stale.pyo").exists()
+
+
 def test_maybe_chunk_database_rejects_zero_chunk_size(tmp_path: Path) -> None:
     snapshot = _build_snapshot(tmp_path)
     output_dir = tmp_path / "bundle"

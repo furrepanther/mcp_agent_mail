@@ -1794,7 +1794,16 @@ def copy_viewer_assets(output_dir: Path) -> None:
     # Attempt to copy from live source tree first
     source_tree = Path(__file__).parent / "viewer_assets"
     if source_tree.exists() and source_tree.is_dir():
-        for src_path in sorted(p for p in source_tree.rglob("*") if p.is_file()):
+        # A live checkout can contain interpreter bytecode from the import that
+        # reached this export path. Those files are neither viewer assets nor
+        # reproducible release inputs and must never leak into an export.
+        for src_path in sorted(
+            p
+            for p in source_tree.rglob("*")
+            if p.is_file()
+            and "__pycache__" not in p.parts
+            and p.suffix not in {".pyc", ".pyo"}
+        ):
             rel = src_path.relative_to(source_tree)
             dest = viewer_root / rel
             dest.parent.mkdir(parents=True, exist_ok=True)
