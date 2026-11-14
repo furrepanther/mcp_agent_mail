@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import sqlite3
+from pathlib import Path
 
 import pytest
 from fastmcp import Client
@@ -11,6 +12,7 @@ from sqlalchemy.exc import IntegrityError
 
 import mcp_agent_mail.app as app_module
 from mcp_agent_mail.app import build_mcp_server
+from mcp_agent_mail.config import clear_settings_cache
 from mcp_agent_mail.db import ensure_schema, get_session
 from mcp_agent_mail.models import AgentMailBridgeDelivery
 
@@ -21,6 +23,70 @@ def _tool_list(result):
         if isinstance(structured, list):
             return structured
     return list(getattr(result, "data", result))
+
+
+def test_legacy_bridge_attestation_rejects_blank_body():
+    with pytest.raises(app_module.ToolExecutionError, match="non-empty body_md") as exc_info:
+        app_module._validate_inbound_bridge_attestation(
+            body_md=" \n\t",
+            body_sha256=None,
+            attestation_version=0,
+            message_revision=0,
+            supersedes_message_id=None,
+        )
+
+    assert exc_info.value.error_type == "INVALID_BODY_ATTESTATION"
+
+
+def test_host_key_fallback_is_visible_in_logs(monkeypatch, caplog):
+    monkeypatch.delenv("AGENT_MAIL_HOST_KEY", raising=False)
+    monkeypatch.delenv("ANTIGRAVITY_PLATFORM_ID", raising=False)
+    monkeypatch.delenv("AG_PLATFORM_ID", raising=False)
+    monkeypatch.setattr(app_module.os, "uname", lambda: type("Uname", (), {"nodename": "review-host"})())
+
+    with caplog.at_level("WARNING", logger=app_module.logger.name):
+        assert app_module._agent_mail_host_key() == "review-host"
+
+    assert "fallback host key" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_build_slot_lease_persistence_failure_is_reported(isolated_env, monkeypatch):
+    monkeypatch.setenv("WORKTREES_ENABLED", "1")
+    clear_settings_cache()
+    server = build_mcp_server()
+
+    async with Client(server) as client:
+        await client.call_tool("ensure_project", {"human_key": "/home/Antigravity"})
+        registration = await client.call_tool(
+            "register_agent",
+            {
+                "project_key": "/home/Antigravity",
+                "program": "codex",
+                "model": "gpt-5",
+                "name": "RoseStone",
+            },
+        )
+
+        original_to_thread = app_module.asyncio.to_thread
+
+        async def fail_lease_write(func, *args, **kwargs):
+            owner = getattr(func, "__self__", None)
+            if getattr(func, "__name__", "") == "write_text" and isinstance(owner, Path) and "build_slots" in owner.parts:
+                raise OSError("simulated lease storage failure")
+            return await original_to_thread(func, *args, **kwargs)
+
+        monkeypatch.setattr(app_module.asyncio, "to_thread", fail_lease_write)
+        with pytest.raises(ToolError, match="Could not persist build slot lease"):
+            await client.call_tool(
+                "acquire_build_slot",
+                {
+                    "project_key": "/home/Antigravity",
+                    "agent_name": "RoseStone",
+                    "registration_token": registration.data["registration_token"],
+                    "slot": "bridge-review",
+                },
+            )
 
 
 async def _configure_peer(client, host_key: str, project_key: str = "/remote/default", token: str = "test-bridge-token"):

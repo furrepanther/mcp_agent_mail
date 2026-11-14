@@ -231,9 +231,9 @@ async def _stabilize_timestamps(base: datetime) -> None:
         rows = await session.execute(
             text("SELECT message_id, agent_id, read_ts, ack_ts FROM message_recipients")
         )
-        for row in rows.fetchall():
+        for row_index, row in enumerate(rows.fetchall(), start=1):
             if row[2] is not None:
-                read_ts = base + timedelta(seconds=300 + int(row[0]))
+                read_ts = base + timedelta(seconds=300 + row_index)
                 await session.execute(
                     text(
                         "UPDATE message_recipients SET read_ts = :read_ts WHERE message_id = :mid AND agent_id = :aid"
@@ -241,7 +241,7 @@ async def _stabilize_timestamps(base: datetime) -> None:
                     {"read_ts": read_ts, "mid": row[0], "aid": row[1]},
                 )
             if row[3] is not None:
-                ack_ts = base + timedelta(seconds=400 + int(row[0]))
+                ack_ts = base + timedelta(seconds=400 + row_index)
                 await session.execute(
                     text(
                         "UPDATE message_recipients SET ack_ts = :ack_ts WHERE message_id = :mid AND agent_id = :aid"

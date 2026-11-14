@@ -2041,6 +2041,12 @@ def _validate_inbound_bridge_attestation(
             recoverable=True,
         ) from exc
     if version == 0:
+        if not isinstance(body_md, str) or not body_md.strip():
+            raise ToolExecutionError(
+                "INVALID_BODY_ATTESTATION",
+                "Legacy bridge messages require a non-empty body_md payload.",
+                recoverable=True,
+            )
         if body_sha256 is not None or revision != 0 or supersedes is not None:
             raise ToolExecutionError(
                 "INVALID_BODY_ATTESTATION",
@@ -2127,7 +2133,12 @@ def _agent_mail_host_key() -> str:
         return "Datacube"
     if lowered.startswith("primus"):
         return "Primus"
-    return hostname or "local"
+    fallback = hostname or "local"
+    logger.warning(
+        "Agent Mail host key is not explicitly configured; using fallback host key",
+        extra={"fallback_host_key": fallback},
+    )
+    return fallback
 
 
 def _normalize_bridge_host(value: str) -> str:
@@ -7278,8 +7289,17 @@ def build_mcp_server() -> FastMCP:
                             "authored_ts": _iso(datetime.fromtimestamp(commit.authored_date, tz=timezone.utc)),
                         }
                     )
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning(
+                    "Unable to read recent archive commits for whois",
+                    extra={
+                        "project_key": project.human_key,
+                        "agent_name": agent_name,
+                        "commit_limit": commit_limit,
+                        "error_type": type(exc).__name__,
+                    },
+                    exc_info=True,
+                )
         profile["recent_commits"] = recent
         await ctx.info(f"whois for '{agent_name}' in '{project.human_key}' returned {len(recent)} commits")
         return profile
@@ -12384,8 +12404,19 @@ def build_mcp_server() -> FastMCP:
                 "acquired_ts": _iso(now),
                 "expires_ts": _iso(now + timedelta(seconds=max(ttl_seconds, 60))),
             }
-            with contextlib.suppress(Exception):
+            try:
                 await asyncio.to_thread(lease_path.write_text, json.dumps(payload, indent=2), "utf-8")
+            except Exception as exc:
+                logger.warning(
+                    "build slot lease persistence failed",
+                    extra={"project": project.slug, "slot": slot, "agent": agent.name},
+                    exc_info=True,
+                )
+                raise ToolExecutionError(
+                    "LEASE_PERSISTENCE_FAILED",
+                    f"Could not persist build slot lease for '{slot}'.",
+                    recoverable=True,
+                ) from exc
             if conflicts:
                 await ctx.info(f"Build slot conflicts for '{slot}': {len(conflicts)}")
             return {"granted": payload, "conflicts": conflicts}
@@ -12425,8 +12456,19 @@ def build_mcp_server() -> FastMCP:
                 current = {}
             new_exp = _iso(now + timedelta(seconds=max(extend_seconds, 60)))
             current.update({"slot": slot, "agent": agent.name, "branch": branch, "expires_ts": new_exp})
-            with contextlib.suppress(Exception):
+            try:
                 await asyncio.to_thread(lease_path.write_text, json.dumps(current, indent=2), "utf-8")
+            except Exception as exc:
+                logger.warning(
+                    "build slot lease renewal persistence failed",
+                    extra={"project": project.slug, "slot": slot, "agent": agent.name},
+                    exc_info=True,
+                )
+                raise ToolExecutionError(
+                    "LEASE_PERSISTENCE_FAILED",
+                    f"Could not renew build slot lease for '{slot}'.",
+                    recoverable=True,
+                ) from exc
             return {"renewed": True, "expires_ts": new_exp}
 
         @mcp.tool(name="release_build_slot")
@@ -12466,6 +12508,11 @@ def build_mcp_server() -> FastMCP:
                 await asyncio.to_thread(lease_path.write_text, json.dumps(data, indent=2), "utf-8")
                 released = True
             except Exception:
+                logger.warning(
+                    "build slot lease release persistence failed",
+                    extra={"project": project.slug, "slot": slot, "agent": agent.name},
+                    exc_info=True,
+                )
                 released = False
             return {"released": released, "released_at": _iso(now)}
 
