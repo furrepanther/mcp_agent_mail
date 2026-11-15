@@ -1309,6 +1309,9 @@ async def test_flush_bridge_deliveries_pushes_to_configured_peer(isolated_env, m
 
         assert flushed.data["processed"] == 1
         assert flushed.data["remote_received"] == 1
+        assert flushed.data["delivered"] == 0
+        assert flushed.data["completed"] == 0
+        assert flushed.data["results"][0]["transport_state"] == "remote_received"
         assert calls[0]["api_url"] == "http://127.0.0.1:18766/api/"
         assert calls[0]["tool_name"] == "bridge_receive_message"
         args = calls[0]["arguments"]
