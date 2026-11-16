@@ -23,6 +23,26 @@ def _tool_list(result):
     return list(getattr(result, "data", result))
 
 
+async def _upsert_peer(client, host_key, token, project_key="/peer-project"):
+    await client.call_tool(
+        "upsert_bridge_peer",
+        {
+            "host_key": host_key,
+            "api_url": "http://peer.invalid/api/",
+            "project_key": project_key,
+            "auth_token": token,
+            "bridge_protocol_version": 1,
+        },
+    )
+
+
+def test_parse_mcp_tool_payload_rejects_remote_tool_error():
+    raw = '{"jsonrpc":"2.0","id":"1","result":{"isError":true,"content":[{"type":"text","text":"peer rejected bridge_receive_message"}]}}'
+
+    with pytest.raises(RuntimeError, match="MCP tool error"):
+        app_module._parse_mcp_tool_payload(raw)
+
+
 @pytest.mark.asyncio
 async def test_name_at_host_queues_remote_delivery(isolated_env, monkeypatch):
     monkeypatch.setenv("AGENT_MAIL_HOST_KEY", "Datacube")
@@ -44,7 +64,7 @@ async def test_name_at_host_queues_remote_delivery(isolated_env, monkeypatch):
             {
                 "project_key": "/home/Antigravity",
                 "sender_name": "RoseStone",
-                "to": ["SwiftCat@Primus"],
+                "to": ["RoseStone@Primus"],
                 "subject": "Bridge smoke",
                 "body_md": "queued body",
                 "thread_id": "bridge-smoke",
@@ -56,7 +76,7 @@ async def test_name_at_host_queues_remote_delivery(isolated_env, monkeypatch):
         bridge = sent.data["bridge_deliveries"][0]
         assert bridge["source_host"] == "Datacube"
         assert bridge["dest_host"] == "Primus"
-        assert bridge["dest_agent"] == "SwiftCat"
+        assert bridge["dest_agent"] == "RoseStone"
         assert bridge["status"] == "queued"
 
         identities = await client.call_tool(
@@ -64,7 +84,7 @@ async def test_name_at_host_queues_remote_delivery(isolated_env, monkeypatch):
             {"project_key": "/home/Antigravity", "include_remote": True},
         )
         assert any(
-            item["host_key"] == "Primus" and item["agent_name"] == "SwiftCat"
+            item["host_key"] == "Primus" and item["agent_name"] == "RoseStone"
             for item in identities.data["remote"]
         )
 
@@ -95,6 +115,7 @@ async def test_reply_to_bridged_message_routes_to_remote_sender_and_preserves_th
             "upsert_bridge_peer",
             {
                 "host_key": "Primus",
+                "auth_token": "test-primus-peer-token",
                 "api_url": "http://127.0.0.1:18766/api/",
                 "project_key": "/peer-default-project",
                 "bridge_protocol_version": 1,
@@ -108,7 +129,8 @@ async def test_reply_to_bridged_message_routes_to_remote_sender_and_preserves_th
                 "subject": "Remote work order",
                 "body_md": "Please verify the bridge reply path.",
                 "source_host": "Primus",
-                "source_agent": "SwiftCat",
+                "peer_token": "test-primus-peer-token",
+                "source_agent": "RoseStone",
                 "source_project_key": "/remote-origin-project",
                 "external_message_id": "primus-42",
                 "external_thread_id": "primus-thread-42",
@@ -132,33 +154,28 @@ async def test_reply_to_bridged_message_routes_to_remote_sender_and_preserves_th
         assert replied.data["remote_delivery_state"] == "queued_remote"
         bridge = replied.data["bridge_deliveries"][0]
         assert bridge["dest_host"] == "Primus"
-        assert bridge["dest_agent"] == "SwiftCat"
+        assert bridge["dest_agent"] == "RoseStone"
         assert bridge["dest_project_key"] == "/remote-origin-project"
 
         flushed = await client.call_tool("flush_bridge_deliveries", {"dest_host": "Primus", "limit": 1})
         assert flushed.data["delivered"] == 1
         assert calls[0]["tool_name"] == "bridge_receive_message"
         args = calls[0]["arguments"]
-        assert args["to"] == ["SwiftCat"]
+        assert args["to"] == ["RoseStone"]
         assert args["project_key"] == "/remote-origin-project"
         assert args["body_md"] == reply_body
         assert args["external_thread_id"] == "primus-thread-42"
 
 
 @pytest.mark.asyncio
-async def test_reply_to_bridged_message_without_remote_project_fails_closed(isolated_env, monkeypatch):
+async def test_bridge_receive_without_remote_project_fails_closed(isolated_env, monkeypatch):
     monkeypatch.setenv("AGENT_MAIL_HOST_KEY", "Datacube")
     bridge_calls = []
     error_types = []
 
-    async def fake_call_bridge_peer_tool(**kwargs):
-        bridge_calls.append(kwargs)
-        return {"id": 4243}
-
     def capture_tool_error(_tool_name, error):
         error_types.append(error.error_type)
 
-    monkeypatch.setattr(app_module, "_call_bridge_peer_tool", fake_call_bridge_peer_tool)
     monkeypatch.setattr(app_module, "_record_tool_error", capture_tool_error)
     server = build_mcp_server()
     async with Client(server) as client:
@@ -176,12 +193,13 @@ async def test_reply_to_bridged_message_without_remote_project_fails_closed(isol
             "upsert_bridge_peer",
             {
                 "host_key": "Primus",
+                "auth_token": "test-primus-peer-token",
                 "api_url": "http://127.0.0.1:18766/api/",
                 "project_key": "/peer-default-project",
                 "bridge_protocol_version": 1,
             },
         )
-        inbound = await client.call_tool(
+        failed = await client.call_tool_mcp(
             "bridge_receive_message",
             {
                 "project_key": "/home/Antigravity",
@@ -189,31 +207,18 @@ async def test_reply_to_bridged_message_without_remote_project_fails_closed(isol
                 "subject": "Remote work order without project provenance",
                 "body_md": "This input intentionally omits source_project_key.",
                 "source_host": "Primus",
-                "source_agent": "SwiftCat",
+                "peer_token": "test-primus-peer-token",
+                "source_agent": "RoseStone",
                 "external_message_id": "primus-missing-project",
                 "external_thread_id": "primus-thread-missing-project",
                 "bridge_dedupe_id": "primus:missing-project:datacube",
             },
         )
-
-        before = await client.call_tool("list_bridge_deliveries", {"dest_host": "Primus"})
-        failed = await client.call_tool_mcp(
-            "reply_message",
-            {
-                "project_key": "/home/Antigravity",
-                "message_id": inbound.data["id"],
-                "sender_name": "RoseStone",
-                "body_md": "Do not route this reply to the peer default project.",
-            },
-        )
         error_text = " ".join(getattr(content, "text", "") for content in failed.content)
-        after = await client.call_tool("list_bridge_deliveries", {"dest_host": "Primus"})
 
         assert failed.isError is True
-        assert error_types == ["INVALID_REMOTE_PROVENANCE"]
-        assert "original remote project key" in error_text
-        assert before.data == []
-        assert after.data == []
+        assert error_types == ["INVALID_BRIDGE_PROJECT"]
+        assert "source project key" in error_text
         assert bridge_calls == []
 
 
@@ -222,6 +227,7 @@ async def test_bridge_receive_preserves_remote_provenance(isolated_env, monkeypa
     monkeypatch.setenv("AGENT_MAIL_HOST_KEY", "Primus")
     server = build_mcp_server()
     async with Client(server) as client:
+        await _upsert_peer(client, "Datacube", "test-datacube-peer-token")
         await client.call_tool("ensure_project", {"human_key": "/home/antigravity"})
         registration = await client.call_tool(
             "register_agent",
@@ -229,7 +235,7 @@ async def test_bridge_receive_preserves_remote_provenance(isolated_env, monkeypa
                 "project_key": "/home/antigravity",
                 "program": "codex",
                 "model": "gpt-5",
-                "name": "SwiftCat",
+                "name": "RoseStone",
             },
         )
         token = registration.data["registration_token"]
@@ -238,10 +244,11 @@ async def test_bridge_receive_preserves_remote_provenance(isolated_env, monkeypa
             "bridge_receive_message",
             {
                 "project_key": "/home/antigravity",
-                "to": ["SwiftCat"],
+                "to": ["RoseStone"],
                 "subject": "Inbound",
                 "body_md": "from datacube",
                 "source_host": "Datacube",
+                "peer_token": "test-datacube-peer-token",
                 "source_agent": "RoseStone",
                 "source_project_key": "/home/Antigravity",
                 "external_message_id": "11192",
@@ -262,7 +269,7 @@ async def test_bridge_receive_preserves_remote_provenance(isolated_env, monkeypa
             "fetch_inbox",
             {
                 "project_key": "/home/antigravity",
-                "agent_name": "SwiftCat",
+                "agent_name": "RoseStone",
                 "registration_token": token,
                 "include_bodies": True,
                 "topic": "cross-system",
@@ -277,11 +284,13 @@ async def test_bridge_receive_preserves_remote_provenance(isolated_env, monkeypa
             "bridge_receive_message",
             {
                 "project_key": "/home/antigravity",
-                "to": ["SwiftCat"],
+                "to": ["RoseStone"],
                 "subject": "Inbound",
                 "body_md": "from datacube",
                 "source_host": "Datacube",
+                "peer_token": "test-datacube-peer-token",
                 "source_agent": "RoseStone",
+                "source_project_key": "/home/Antigravity",
                 "external_message_id": "11192",
                 "bridge_dedupe_id": "datacube:11192:swiftcat",
             },
@@ -300,6 +309,7 @@ async def test_bridge_receive_attested_digest_is_verified_and_idempotent(isolate
     monkeypatch.setattr(app_module, "_record_tool_error", capture_tool_error)
     server = build_mcp_server()
     async with Client(server) as client:
+        await _upsert_peer(client, "Datacube", "test-datacube-peer-token")
         await client.call_tool("ensure_project", {"human_key": "/home/antigravity"})
         await client.call_tool(
             "register_agent",
@@ -307,18 +317,20 @@ async def test_bridge_receive_attested_digest_is_verified_and_idempotent(isolate
                 "project_key": "/home/antigravity",
                 "program": "codex",
                 "model": "gpt-5",
-                "name": "SwiftCat",
+                "name": "RoseStone",
             },
         )
         body = "exact UTF-8 body: cafe\u0301"
         digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
         args = {
             "project_key": "/home/antigravity",
-            "to": ["SwiftCat"],
+            "to": ["RoseStone"],
             "subject": "Attested inbound",
             "body_md": body,
             "source_host": "Datacube",
+            "peer_token": "test-datacube-peer-token",
             "source_agent": "RoseStone",
+            "source_project_key": "/home/Antigravity",
             "external_message_id": "attested-100",
             "bridge_dedupe_id": "datacube:attested-100:swiftcat",
             "body_sha256": digest,
@@ -547,6 +559,7 @@ async def test_schema_migrates_existing_sqlite_bridge_and_message_tables(isolate
 async def test_bridge_revision_lineage_is_scoped_to_project_and_remote_provenance(isolated_env):
     server = build_mcp_server()
     async with Client(server) as client:
+        await _upsert_peer(client, "Datacube", "test-datacube-peer-token")
         for project_key in ("/home/alpha", "/home/beta"):
             await client.call_tool("ensure_project", {"human_key": project_key})
             await client.call_tool(
@@ -555,7 +568,7 @@ async def test_bridge_revision_lineage_is_scoped_to_project_and_remote_provenanc
                     "project_key": project_key,
                     "program": "codex",
                     "model": "gpt-5",
-                    "name": "SwiftCat",
+                    "name": "RoseStone",
                 },
             )
 
@@ -564,10 +577,11 @@ async def test_bridge_revision_lineage_is_scoped_to_project_and_remote_provenanc
             "bridge_receive_message",
             {
                 "project_key": "/home/alpha",
-                "to": ["SwiftCat"],
+                "to": ["RoseStone"],
                 "subject": "Alpha history",
                 "body_md": first_body,
                 "source_host": "Datacube",
+                "peer_token": "test-datacube-peer-token",
                 "source_agent": "RoseStone",
                 "source_project_key": "/remote/alpha",
                 "external_message_id": "shared-12655",
@@ -583,10 +597,11 @@ async def test_bridge_revision_lineage_is_scoped_to_project_and_remote_provenanc
             "bridge_receive_message",
             {
                 "project_key": "/home/beta",
-                "to": ["SwiftCat"],
+                "to": ["RoseStone"],
                 "subject": "Beta correction",
                 "body_md": beta_body,
                 "source_host": "Datacube",
+                "peer_token": "test-datacube-peer-token",
                 "source_agent": "AmberGrove",
                 "source_project_key": "/remote/beta",
                 "external_message_id": "shared-12660",
@@ -614,6 +629,7 @@ async def test_bridge_revision_lineage_is_scoped_to_project_and_remote_provenanc
 async def test_bridge_dedupe_scope_prevents_cross_project_remote_collision(isolated_env):
     server = build_mcp_server()
     async with Client(server) as client:
+        await _upsert_peer(client, "Datacube", "test-datacube-peer-token")
         for project_key in ("/home/alpha", "/home/beta"):
             await client.call_tool("ensure_project", {"human_key": project_key})
             await client.call_tool(
@@ -622,7 +638,7 @@ async def test_bridge_dedupe_scope_prevents_cross_project_remote_collision(isola
                     "project_key": project_key,
                     "program": "codex",
                     "model": "gpt-5",
-                    "name": "SwiftCat",
+                    "name": "RoseStone",
                 },
             )
 
@@ -631,10 +647,11 @@ async def test_bridge_dedupe_scope_prevents_cross_project_remote_collision(isola
             "bridge_receive_message",
             {
                 "project_key": "/home/alpha",
-                "to": ["SwiftCat"],
+                "to": ["RoseStone"],
                 "subject": "Alpha root",
                 "body_md": alpha_body,
                 "source_host": "Datacube",
+                "peer_token": "test-datacube-peer-token",
                 "source_agent": "RoseStone",
                 "source_project_key": "/remote/alpha",
                 "external_message_id": "shared-12655",
@@ -650,10 +667,11 @@ async def test_bridge_dedupe_scope_prevents_cross_project_remote_collision(isola
             "bridge_receive_message",
             {
                 "project_key": "/home/beta",
-                "to": ["SwiftCat"],
+                "to": ["RoseStone"],
                 "subject": "Beta correction",
                 "body_md": beta_body,
                 "source_host": "Datacube",
+                "peer_token": "test-datacube-peer-token",
                 "source_agent": "RoseStone",
                 "source_project_key": "/remote/beta",
                 "external_message_id": "shared-12660",
@@ -685,6 +703,7 @@ async def test_bridge_receive_concurrent_idempotent_retry_rereads_scoped_duplica
         return await original_create_message(*args, **kwargs)
 
     async with Client(server) as client:
+        await _upsert_peer(client, "Datacube", "test-datacube-peer-token")
         await client.call_tool("ensure_project", {"human_key": "/home/antigravity"})
         await client.call_tool(
             "register_agent",
@@ -692,7 +711,7 @@ async def test_bridge_receive_concurrent_idempotent_retry_rereads_scoped_duplica
                 "project_key": "/home/antigravity",
                 "program": "codex",
                 "model": "gpt-5",
-                "name": "SwiftCat",
+                "name": "RoseStone",
             },
         )
         monkeypatch.setattr(app_module, "_create_message", create_then_simulate_unique_race)
@@ -701,10 +720,11 @@ async def test_bridge_receive_concurrent_idempotent_retry_rereads_scoped_duplica
             "bridge_receive_message",
             {
                 "project_key": "/home/antigravity",
-                "to": ["SwiftCat"],
+                "to": ["RoseStone"],
                 "subject": "Concurrent retry",
                 "body_md": body,
                 "source_host": "Datacube",
+                "peer_token": "test-datacube-peer-token",
                 "source_agent": "RoseStone",
                 "source_project_key": "/remote/antigravity",
                 "external_message_id": "race-12665",
@@ -723,8 +743,9 @@ async def test_bridge_receive_concurrent_idempotent_retry_rereads_scoped_duplica
 async def test_legacy_history_can_be_superseded_but_not_retroactively_attested(isolated_env):
     server = build_mcp_server()
     async with Client(server) as client:
+        await _upsert_peer(client, "Datacube", "test-datacube-peer-token")
         await client.call_tool("ensure_project", {"human_key": "/home/antigravity"})
-        for name in ("SwiftCat", "RoseStone"):
+        for name in ("RoseStone", "AmberGrove"):
             await client.call_tool(
                 "register_agent",
                 {
@@ -738,11 +759,13 @@ async def test_legacy_history_can_be_superseded_but_not_retroactively_attested(i
             "bridge_receive_message",
             {
                 "project_key": "/home/antigravity",
-                "to": ["SwiftCat"],
+                "to": ["RoseStone"],
                 "subject": "Legacy 12655",
                 "body_md": "legacy body",
                 "source_host": "Datacube",
+                "peer_token": "test-datacube-peer-token",
                 "source_agent": "RoseStone",
+                "source_project_key": "/home/Antigravity",
                 "external_message_id": "12655",
                 "bridge_dedupe_id": "datacube:12655:swiftcat",
             },
@@ -776,7 +799,7 @@ async def test_legacy_history_can_be_superseded_but_not_retroactively_attested(i
             {
                 "project_key": "/home/antigravity",
                 "sender_name": "RoseStone",
-                "to": ["SwiftCat"],
+                "to": ["RoseStone"],
                 "subject": "Supersedes legacy 12655",
                 "body_md": "attested replacement",
                 "supersedes_message_id": legacy_id,
@@ -822,6 +845,7 @@ async def test_bridge_flush_refuses_source_body_mutated_after_queue(isolated_env
             "upsert_bridge_peer",
             {
                 "host_key": "Primus",
+                "auth_token": "test-primus-peer-token",
                 "api_url": "http://127.0.0.1:18766/api/",
                 "project_key": "/home/antigravity",
                 "bridge_protocol_version": 1,
@@ -832,7 +856,7 @@ async def test_bridge_flush_refuses_source_body_mutated_after_queue(isolated_env
             {
                 "project_key": "/home/Antigravity",
                 "sender_name": "RoseStone",
-                "to": ["SwiftCat@Primus"],
+                "to": ["RoseStone@Primus"],
                 "subject": "Queued body mutation",
                 "body_md": "original queued body",
             },
@@ -884,6 +908,7 @@ async def test_bridge_flush_blocks_attested_delivery_for_legacy_peer(isolated_en
             "upsert_bridge_peer",
             {
                 "host_key": "Primus",
+                "auth_token": "test-primus-peer-token",
                 "api_url": "http://127.0.0.1:18766/api/",
                 "project_key": "/home/antigravity",
             },
@@ -893,7 +918,7 @@ async def test_bridge_flush_blocks_attested_delivery_for_legacy_peer(isolated_en
             {
                 "project_key": "/home/Antigravity",
                 "sender_name": "RoseStone",
-                "to": ["SwiftCat@Primus"],
+                "to": ["RoseStone@Primus"],
                 "subject": "Attested must not downgrade",
                 "body_md": "attested body",
             },
@@ -934,13 +959,14 @@ async def test_flush_migrated_legacy_delivery_uses_legacy_wire_shape(isolated_en
                 "project_key": "/home/Antigravity",
                 "program": "codex",
                 "model": "gpt-5",
-                "name": "SwiftCat",
+                "name": "RoseStone",
             },
         )
         await client.call_tool(
             "upsert_bridge_peer",
             {
                 "host_key": "Primus",
+                "auth_token": "test-primus-peer-token",
                 "api_url": "http://127.0.0.1:18766/api/",
                 "project_key": "/home/antigravity",
             },
@@ -949,11 +975,12 @@ async def test_flush_migrated_legacy_delivery_uses_legacy_wire_shape(isolated_en
             "bridge_receive_message",
             {
                 "project_key": "/home/Antigravity",
-                "to": ["SwiftCat"],
+                "to": ["RoseStone"],
                 "subject": "Migrated legacy source",
                 "body_md": "legacy body",
                 "source_host": "Primus",
-                "source_agent": "SwiftCat",
+                "peer_token": "test-primus-peer-token",
+                "source_agent": "RoseStone",
                 "source_project_key": "/home/primus",
                 "external_message_id": "legacy-1",
                 "bridge_dedupe_id": "primus:legacy-1",
@@ -968,7 +995,7 @@ async def test_flush_migrated_legacy_delivery_uses_legacy_wire_shape(isolated_en
                     source_agent="RoseStone",
                     source_project_key="/home/Antigravity",
                     dest_host="Primus",
-                    dest_agent="SwiftCat",
+                    dest_agent="RoseStone",
                     dest_project_key="/home/antigravity",
                     status="queued",
                 )
@@ -998,7 +1025,7 @@ async def test_bridge_rejects_remote_export_of_cross_origin_supersession(isolate
     server = build_mcp_server()
     async with Client(server) as client:
         await client.call_tool("ensure_project", {"human_key": "/home/Antigravity"})
-        for name in ("RoseStone", "SwiftCat"):
+        for name in ("RoseStone", "AmberGrove"):
             await client.call_tool(
                 "register_agent",
                 {
@@ -1012,6 +1039,7 @@ async def test_bridge_rejects_remote_export_of_cross_origin_supersession(isolate
             "upsert_bridge_peer",
             {
                 "host_key": "Primus",
+                "auth_token": "test-primus-peer-token",
                 "api_url": "http://127.0.0.1:18766/api/",
                 "project_key": "/home/primus",
                 "bridge_protocol_version": 1,
@@ -1026,7 +1054,8 @@ async def test_bridge_rejects_remote_export_of_cross_origin_supersession(isolate
                 "subject": "Remote root",
                 "body_md": inbound_body,
                 "source_host": "Primus",
-                "source_agent": "SwiftCat",
+                "peer_token": "test-primus-peer-token",
+                "source_agent": "RoseStone",
                 "source_project_key": "/home/primus",
                 "external_message_id": "primus-12655",
                 "bridge_dedupe_id": "primus:12655",
@@ -1040,7 +1069,7 @@ async def test_bridge_rejects_remote_export_of_cross_origin_supersession(isolate
             {
                 "project_key": "/home/Antigravity",
                 "sender_name": "RoseStone",
-                "to": ["SwiftCat@Primus"],
+                "to": ["RoseStone@Primus"],
                 "subject": "Local correction",
                 "body_md": "local correction body",
                 "supersedes_message_id": inbound.data["id"],
@@ -1071,7 +1100,7 @@ async def test_bridge_receive_peer_token_enforced_when_configured(isolated_env):
                 "project_key": "/home/antigravity",
                 "program": "codex",
                 "model": "gpt-5",
-                "name": "SwiftCat",
+                "name": "RoseStone",
             },
         )
         await client.call_tool(
@@ -1084,11 +1113,12 @@ async def test_bridge_receive_peer_token_enforced_when_configured(isolated_env):
                 "bridge_receive_message",
                 {
                     "project_key": "/home/antigravity",
-                    "to": ["SwiftCat"],
+                    "to": ["RoseStone"],
                     "subject": "Inbound",
                     "body_md": "from datacube",
                     "source_host": "Datacube",
                     "source_agent": "RoseStone",
+                    "source_project_key": "/home/Antigravity",
                     "peer_token": "wrong",
                 },
             )
@@ -1097,15 +1127,233 @@ async def test_bridge_receive_peer_token_enforced_when_configured(isolated_env):
             "bridge_receive_message",
             {
                 "project_key": "/home/antigravity",
-                "to": ["SwiftCat"],
+                "to": ["RoseStone"],
                 "subject": "Inbound",
                 "body_md": "from datacube",
                 "source_host": "Datacube",
                 "source_agent": "RoseStone",
+                "source_project_key": "/home/Antigravity",
                 "peer_token": "secret",
             },
         )
         assert ok.data["from"] == "RoseStone@Datacube"
+
+
+@pytest.mark.asyncio
+async def test_bridge_receive_fails_closed_for_unknown_or_missing_peer_token(isolated_env):
+    server = build_mcp_server()
+    async with Client(server) as client:
+        await client.call_tool("ensure_project", {"human_key": "/home/antigravity"})
+        await client.call_tool(
+            "register_agent",
+            {
+                "project_key": "/home/antigravity",
+                "program": "codex",
+                "model": "gpt-5",
+                "name": "PurpleCanyon",
+            },
+        )
+        unknown_peer = await client.call_tool_mcp(
+            "bridge_receive_message",
+            {
+                "project_key": "/home/antigravity",
+                "to": ["PurpleCanyon"],
+                "subject": "Unknown peer",
+                "body_md": "must not be accepted",
+                "source_host": "Datacube",
+                "source_agent": "PurpleCanyon",
+                "source_project_key": "/home/Antigravity",
+            },
+        )
+        unknown_text = " ".join(getattr(content, "text", "") for content in unknown_peer.content)
+        assert unknown_peer.isError is True
+        assert "configured enabled peer" in unknown_text
+
+        await _upsert_peer(client, "Datacube", "test-datacube-peer-token")
+        missing_token = await client.call_tool_mcp(
+            "bridge_receive_message",
+            {
+                "project_key": "/home/antigravity",
+                "to": ["PurpleCanyon"],
+                "subject": "Missing token",
+                "body_md": "must not be accepted",
+                "source_host": "Datacube",
+                "source_agent": "PurpleCanyon",
+                "source_project_key": "/home/Antigravity",
+            },
+        )
+        missing_text = " ".join(getattr(content, "text", "") for content in missing_token.content)
+        assert missing_token.isError is True
+        assert "matching peer_token" in missing_text
+
+
+@pytest.mark.asyncio
+async def test_bridge_rejects_stale_and_blank_federated_identities(isolated_env, monkeypatch):
+    monkeypatch.setenv("AGENT_MAIL_HOST_KEY", "Datacube")
+    server = build_mcp_server()
+    async with Client(server) as client:
+        await client.call_tool("ensure_project", {"human_key": "/home/Antigravity"})
+        await client.call_tool(
+            "register_agent",
+            {
+                "project_key": "/home/Antigravity",
+                "program": "codex",
+                "model": "gpt-5",
+                "name": "PurpleCanyon",
+            },
+        )
+        for target in ("SwiftCat@Primus", "SwiftCat@datacube", "@Primus"):
+            failed = await client.call_tool_mcp(
+                "send_message",
+                {
+                    "project_key": "/home/Antigravity",
+                    "sender_name": "PurpleCanyon",
+                    "to": [target],
+                    "subject": "Invalid identity",
+                    "body_md": "must be rejected before queueing",
+                },
+            )
+            error_text = " ".join(getattr(content, "text", "") for content in failed.content)
+            assert failed.isError is True
+            if target.startswith("SwiftCat"):
+                assert "stale agent identity" in error_text
+            else:
+                assert "non-empty agent and host" in error_text
+
+        stale_inbound = await client.call_tool_mcp(
+            "bridge_receive_message",
+            {
+                "project_key": "/home/Antigravity",
+                "to": ["PurpleCanyon"],
+                "subject": "Stale inbound",
+                "body_md": "must be rejected before authentication",
+                "source_host": "Primus",
+                "source_agent": "SwiftCat",
+                "source_project_key": "/home/antigravity",
+            },
+        )
+        stale_text = " ".join(getattr(content, "text", "") for content in stale_inbound.content)
+        assert stale_inbound.isError is True
+        assert "stale agent identity" in stale_text
+
+
+@pytest.mark.asyncio
+async def test_flush_blocks_missing_outbound_peer_token_durably(isolated_env, monkeypatch):
+    for name in (
+        "AGENT_MAIL_BRIDGE_PEER_TOKEN_PRIMUS",
+        "ANTIGRAVITY_AGENT_MAIL_BRIDGE_PEER_TOKEN_PRIMUS",
+        "AGENT_MAIL_BRIDGE_PEER_TOKEN",
+        "ANTIGRAVITY_AGENT_MAIL_BRIDGE_PEER_TOKEN",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    calls = []
+
+    async def fake_call_bridge_peer_tool(**kwargs):
+        calls.append(kwargs)
+        return {"id": "should-not-be-called"}
+
+    monkeypatch.setattr(app_module, "_call_bridge_peer_tool", fake_call_bridge_peer_tool)
+    monkeypatch.setenv("AGENT_MAIL_HOST_KEY", "Datacube")
+    server = build_mcp_server()
+    async with Client(server) as client:
+        await client.call_tool("ensure_project", {"human_key": "/home/Antigravity"})
+        await client.call_tool(
+            "register_agent",
+            {
+                "project_key": "/home/Antigravity",
+                "program": "codex",
+                "model": "gpt-5",
+                "name": "PurpleCanyon",
+            },
+        )
+        await client.call_tool(
+            "upsert_bridge_peer",
+            {
+                "host_key": "Primus",
+                "api_url": "http://127.0.0.1:18766/api/",
+                "project_key": "/home/antigravity",
+                "auth_token": "configured-but-unavailable",
+                "bridge_protocol_version": 1,
+            },
+        )
+        queued = await client.call_tool(
+            "send_message",
+            {
+                "project_key": "/home/Antigravity",
+                "sender_name": "PurpleCanyon",
+                "to": ["RoseStone@Primus"],
+                "subject": "Token gate",
+                "body_md": "must remain queued until token is available",
+            },
+        )
+        assert queued.data["remote_delivery_state"] == "queued_remote"
+
+        flushed = await client.call_tool("flush_bridge_deliveries", {"dest_host": "Primus", "limit": 1})
+        assert flushed.data["blocked"] == 1
+        assert flushed.data["delivered"] == 0
+        assert calls == []
+        assert "token is unavailable" in flushed.data["results"][0]["last_error"]
+
+        monkeypatch.setenv("AGENT_MAIL_BRIDGE_PEER_TOKEN_PRIMUS", "configured-but-unavailable")
+        recovered = await client.call_tool("flush_bridge_deliveries", {"dest_host": "Primus", "limit": 1})
+        assert recovered.data["delivered"] == 1
+        assert recovered.data["results"][0]["remote_message_id"] == "should-not-be-called"
+        assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_flush_transport_failure_is_visible_and_recovers(isolated_env, monkeypatch):
+    calls = []
+
+    async def flaky_call_bridge_peer_tool(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise RuntimeError("peer unreachable during test")
+        return {"id": "recovered-4242"}
+
+    monkeypatch.setattr(app_module, "_call_bridge_peer_tool", flaky_call_bridge_peer_tool)
+    monkeypatch.setenv("AGENT_MAIL_HOST_KEY", "Datacube")
+    server = build_mcp_server()
+    async with Client(server) as client:
+        await client.call_tool("ensure_project", {"human_key": "/home/Antigravity"})
+        await client.call_tool(
+            "register_agent",
+            {
+                "project_key": "/home/Antigravity",
+                "program": "codex",
+                "model": "gpt-5",
+                "name": "PurpleCanyon",
+            },
+        )
+        await client.call_tool(
+            "upsert_bridge_peer",
+            {
+                "host_key": "Primus",
+                "api_url": "http://127.0.0.1:18766/api/",
+                "project_key": "/home/antigravity",
+                "auth_token": "test-primus-peer-token",
+                "bridge_protocol_version": 1,
+            },
+        )
+        await client.call_tool(
+            "send_message",
+            {
+                "project_key": "/home/Antigravity",
+                "sender_name": "PurpleCanyon",
+                "to": ["RoseStone@Primus"],
+                "subject": "Recovery",
+                "body_md": "transport should recover without losing the queue",
+            },
+        )
+
+        first = await client.call_tool("flush_bridge_deliveries", {"dest_host": "Primus", "limit": 1})
+        assert first.data["retry"] == 1
+        assert first.data["results"][0]["last_error"] == "peer unreachable during test"
+
+        second = await client.call_tool("flush_bridge_deliveries", {"dest_host": "Primus", "limit": 1})
+        assert second.data["delivered"] == 1
+        assert second.data["results"][0]["remote_message_id"] == "recovered-4242"
+        assert len(calls) == 2
 
 
 @pytest.mark.asyncio
@@ -1134,6 +1382,7 @@ async def test_flush_bridge_deliveries_pushes_to_configured_peer(isolated_env, m
             "upsert_bridge_peer",
             {
                 "host_key": "Primus",
+                "auth_token": "test-primus-peer-token",
                 "api_url": "http://127.0.0.1:18766/api/",
                 "project_key": "/home/antigravity",
                 "bridge_protocol_version": 1,
@@ -1144,7 +1393,7 @@ async def test_flush_bridge_deliveries_pushes_to_configured_peer(isolated_env, m
             {
                 "project_key": "/home/Antigravity",
                 "sender_name": "RoseStone",
-                "to": ["SwiftCat@Primus"],
+                "to": ["RoseStone@Primus"],
                 "subject": "Bridge flush",
                 "body_md": "deliver body",
                 "thread_id": "bridge-flush",
@@ -1164,11 +1413,11 @@ async def test_flush_bridge_deliveries_pushes_to_configured_peer(isolated_env, m
         assert calls[0]["tool_name"] == "bridge_receive_message"
         args = calls[0]["arguments"]
         assert args["project_key"] == "/home/antigravity"
-        assert args["to"] == ["SwiftCat"]
+        assert args["to"] == ["RoseStone"]
         assert args["source_host"] == "Datacube"
         assert args["source_agent"] == "RoseStone"
         assert args["bridge_id"] == bridge_id
-        assert args["bridge_dedupe_id"] == f"Datacube:{local_message_id}:Primus:SwiftCat"
+        assert args["bridge_dedupe_id"] == f"Datacube:{local_message_id}:Primus:RoseStone"
         assert args["body_sha256"] == snapshot["body_sha256"]
         assert args["attestation_version"] == 1
         assert args["message_revision"] == 1

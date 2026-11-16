@@ -2160,12 +2160,35 @@ def _partition_bridge_recipients(recipients: Sequence[str], kind: str) -> tuple[
     for item in recipients:
         host_key, agent_name = _split_bridge_recipient(item)
         if host_key is None:
+            if "@" in (item or ""):
+                raise ToolExecutionError(
+                    "INVALID_BRIDGE_RECIPIENT",
+                    "A federated Agent Mail recipient must include a non-empty agent and host.",
+                    recoverable=True,
+                )
             if agent_name:
+                _validate_bridge_peer_identity(
+                    _agent_mail_host_key(),
+                    agent_name,
+                    context="local recipient",
+                )
                 local.append(agent_name)
             continue
         if _is_local_bridge_host(host_key):
+            _validate_bridge_peer_identity(
+                host_key,
+                agent_name,
+                require_canonical=True,
+                context="qualified local recipient",
+            )
             local.append(agent_name or item)
             continue
+        _validate_bridge_peer_identity(
+            host_key,
+            agent_name,
+            require_canonical=True,
+            context="outbound recipient",
+        )
         remote.append(
             {
                 "input": item,
@@ -2175,6 +2198,56 @@ def _partition_bridge_recipients(recipients: Sequence[str], kind: str) -> tuple[
             }
         )
     return local, remote
+
+
+_CANONICAL_BRIDGE_AGENT_BY_HOST = {
+    "datacube": "PurpleCanyon",
+    "primus": "RoseStone",
+}
+_STALE_BRIDGE_AGENTS = {"swiftcat", "greenstone", "mister-fixit"}
+
+
+def _validate_bridge_peer_identity(
+    host_key: str,
+    agent_name: str,
+    *,
+    project_key: str = "",
+    require_project: bool = False,
+    require_canonical: bool = False,
+    context: str = "bridge identity",
+) -> None:
+    normalized_host = _normalize_bridge_host(host_key)
+    normalized_agent = str(agent_name or "").strip()
+    if not normalized_host or not normalized_agent:
+        raise ToolExecutionError(
+            "INVALID_BRIDGE_IDENTITY",
+            f"{context} requires a non-empty host and agent name.",
+            recoverable=True,
+        )
+    lowered_agent = normalized_agent.casefold()
+    if lowered_agent in _STALE_BRIDGE_AGENTS:
+        raise ToolExecutionError(
+            "STALE_BRIDGE_IDENTITY",
+            f"{context} uses stale agent identity '{normalized_agent}'; use the canonical peer identity.",
+            recoverable=True,
+            data={"host_key": host_key, "agent_name": normalized_agent},
+        )
+    expected_agent = _CANONICAL_BRIDGE_AGENT_BY_HOST.get(normalized_host)
+    if require_canonical and expected_agent and lowered_agent != expected_agent.casefold():
+        raise ToolExecutionError(
+            "INVALID_BRIDGE_IDENTITY",
+            f"{context} for {host_key} must use {expected_agent}, not {normalized_agent}.",
+            recoverable=True,
+            data={"host_key": host_key, "expected_agent": expected_agent, "agent_name": normalized_agent},
+        )
+    normalized_project = str(project_key or "").strip()
+    if require_project and not normalized_project:
+        raise ToolExecutionError(
+            "INVALID_BRIDGE_PROJECT",
+            f"{context} requires a non-empty source project key.",
+            recoverable=True,
+            data={"host_key": host_key, "agent_name": normalized_agent},
+        )
 
 
 def _public_peer_dict(peer: AgentMailPeer) -> dict[str, Any]:
@@ -2303,11 +2376,15 @@ def _parse_mcp_tool_payload(raw_text: str) -> Any:
     result = payload.get("result")
     if not isinstance(result, dict):
         return result
+    if result.get("isError"):
+        details = result.get("content") or result.get("structuredContent") or "remote tool returned an error"
+        raise RuntimeError(f"MCP tool error: {details}")
     structured = result.get("structuredContent")
     if structured is not None:
-        if isinstance(structured, dict) and "result" in structured:
-            return structured["result"]
-        return structured
+        parsed_structured = structured.get("result") if isinstance(structured, dict) and "result" in structured else structured
+        if isinstance(parsed_structured, dict) and "error" in parsed_structured:
+            raise RuntimeError(f"MCP tool error: {parsed_structured['error']}")
+        return parsed_structured
     for item in result.get("content") or []:
         if not isinstance(item, dict) or item.get("type") != "text":
             continue
@@ -2315,9 +2392,12 @@ def _parse_mcp_tool_payload(raw_text: str) -> Any:
         if not text_value:
             continue
         try:
-            return json.loads(text_value)
+            parsed_text = json.loads(text_value)
         except json.JSONDecodeError:
             return text_value
+        if isinstance(parsed_text, dict) and "error" in parsed_text:
+            raise RuntimeError(f"MCP tool error: {parsed_text['error']}")
+        return parsed_text
     return result
 
 
@@ -4573,6 +4653,26 @@ async def _flush_bridge_deliveries_once(
                 processed += 1
                 continue
 
+            peer_token = _bridge_outbound_peer_token(peer.host_key)
+            blocked_error = ""
+            if not peer.auth_token_hash:
+                blocked_error = "bridge peer authentication token is not configured"
+            elif not peer_token:
+                blocked_error = "bridge peer authentication token is unavailable"
+            elif not hmac.compare_digest(_hash_bridge_token(peer_token), peer.auth_token_hash):
+                blocked_error = "bridge peer authentication token does not match configured peer"
+            if blocked_error:
+                if current.status == "blocked" and current.last_error == blocked_error:
+                    continue
+                current.status = "blocked"
+                current.last_error = blocked_error
+                current.updated_ts = now
+                session.add(current)
+                await session.commit()
+                results.append({**_bridge_delivery_dict(current), "transport_state": "blocked"})
+                processed += 1
+                continue
+
             current.status = "sending"
             current.attempts += 1
             current.last_error = ""
@@ -4623,9 +4723,7 @@ async def _flush_bridge_deliveries_once(
                     "supersedes_message_id": snapshot_supersedes,
                 }
             )
-        peer_token = _bridge_outbound_peer_token(peer_host_key)
-        if peer_token:
-            args["peer_token"] = peer_token
+        args["peer_token"] = peer_token
 
         try:
             remote_payload = await _call_bridge_peer_tool(
@@ -8625,6 +8723,13 @@ def build_mcp_server() -> FastMCP:
                 select(AgentMailPeer).where(func.lower(AgentMailPeer.host_key) == normalized_host.lower())
             )
             peer = result.scalars().first()
+            if enabled and not auth_token and (peer is None or not peer.auth_token_hash):
+                raise ToolExecutionError(
+                    "BRIDGE_PEER_AUTH_REQUIRED",
+                    "An enabled bridge peer must be configured with an authentication token.",
+                    recoverable=True,
+                    data={"host_key": normalized_host},
+                )
             if peer is None:
                 peer = AgentMailPeer(host_key=normalized_host, display_name=display_name or normalized_host)
                 peer.created_ts = now
@@ -8659,6 +8764,13 @@ def build_mcp_server() -> FastMCP:
         format: Optional[str] = None,
     ) -> dict[str, Any]:
         """Register or refresh one remote identity discovered from a peer."""
+        _validate_bridge_peer_identity(
+            host_key,
+            agent_name,
+            project_key=remote_project_key,
+            require_project=True,
+            context="remote identity",
+        )
         identity = await _upsert_remote_identity_record(
             host_key=host_key,
             agent_name=agent_name,
@@ -8718,6 +8830,29 @@ def build_mcp_server() -> FastMCP:
                 "source_host and source_agent are required.",
                 recoverable=True,
             )
+        _validate_bridge_peer_identity(
+            source_host,
+            source_agent,
+            project_key=source_project_key,
+            require_project=True,
+            context="inbound bridge source",
+        )
+        invalid_local_targets = [
+            str(item).strip()
+            for item in to
+            if (
+                not str(item).strip()
+                or "@" in str(item).strip()
+                or str(item).strip().casefold() in _STALE_BRIDGE_AGENTS
+            )
+        ]
+        if invalid_local_targets:
+            raise ToolExecutionError(
+                "INVALID_BRIDGE_RECIPIENT",
+                "Inbound bridge delivery contains a blank or stale local recipient identity.",
+                recoverable=True,
+                data={"invalid_targets": invalid_local_targets, "to": to},
+            )
         (
             normalized_attestation_version,
             normalized_digest,
@@ -8758,16 +8893,15 @@ def build_mcp_server() -> FastMCP:
             )
             peer = peer_result.scalars().first()
             if (
-                peer is not None
-                and peer.auth_token_hash
-                and (
-                    not peer_token
-                    or not hmac.compare_digest(_hash_bridge_token(peer_token), peer.auth_token_hash)
-                )
+                peer is None
+                or not peer.enabled
+                or not peer.auth_token_hash
+                or not peer_token
+                or not hmac.compare_digest(_hash_bridge_token(peer_token), peer.auth_token_hash)
             ):
                 raise ToolExecutionError(
                     "AUTHENTICATION_REQUIRED",
-                    "Invalid or missing peer_token for bridge_receive_message.",
+                    "A configured enabled peer and matching peer_token are required for bridge_receive_message.",
                     recoverable=True,
                 )
             if dedupe_key:
