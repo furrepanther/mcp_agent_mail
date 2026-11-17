@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import sqlite3
 
@@ -1497,6 +1498,69 @@ async def test_flush_transport_failure_is_visible_and_recovers(isolated_env, mon
         assert second.data["delivered"] == 1
         assert second.data["results"][0]["remote_message_id"] == "recovered-4242"
         assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_concurrent_flushers_claim_delivery_once(isolated_env, monkeypatch):
+    monkeypatch.setenv("AGENT_MAIL_HOST_KEY", "Datacube")
+    calls = []
+    network_entered = asyncio.Event()
+    release_network = asyncio.Event()
+
+    async def blocked_call_bridge_peer_tool(**kwargs):
+        calls.append(kwargs)
+        network_entered.set()
+        await release_network.wait()
+        return {"id": "concurrent-4242"}
+
+    monkeypatch.setattr(app_module, "_call_bridge_peer_tool", blocked_call_bridge_peer_tool)
+    server = build_mcp_server()
+    async with Client(server) as client:
+        await client.call_tool("ensure_project", {"human_key": "/home/Antigravity"})
+        await client.call_tool(
+            "register_agent",
+            {
+                "project_key": "/home/Antigravity",
+                "program": "workx",
+                "model": "local",
+                "name": "PurpleCanyon",
+            },
+        )
+        await client.call_tool(
+            "upsert_bridge_peer",
+            {
+                "host_key": "Primus",
+                "auth_token": "test-primus-peer-token",
+                "api_url": "http://127.0.0.1:18766/api/",
+                "project_key": "/home/antigravity",
+                "bridge_protocol_version": 1,
+            },
+        )
+        await client.call_tool(
+            "send_message",
+            {
+                "project_key": "/home/Antigravity",
+                "sender_name": "PurpleCanyon",
+                "to": ["RoseStone@Primus"],
+                "subject": "Concurrent flush claim",
+                "body_md": "only one flusher may own this delivery",
+            },
+        )
+
+        first_task = asyncio.create_task(
+            app_module._flush_bridge_deliveries_once(dest_host="Primus", limit=1)
+        )
+        await asyncio.wait_for(network_entered.wait(), timeout=2)
+        second_task = asyncio.create_task(
+            app_module._flush_bridge_deliveries_once(dest_host="Primus", limit=1)
+        )
+        await asyncio.sleep(0.05)
+        release_network.set()
+        first, second = await asyncio.gather(first_task, second_task)
+
+    assert len(calls) == 1
+    assert first["delivered"] + second["delivered"] == 1
+    assert first["processed"] + second["processed"] == 1
 
 
 @pytest.mark.asyncio

@@ -4603,6 +4603,68 @@ async def _queue_bridge_deliveries(
     return queued
 
 
+async def _claim_bridge_delivery_for_send(
+    session: Any,
+    *,
+    delivery_id: int,
+    current_status: str,
+    claimable_statuses: set[str],
+    stale_cutoff: datetime,
+    now: datetime,
+) -> AgentMailBridgeDelivery | None:
+    """Atomically claim one delivery for network transmission.
+
+    Multiple bridge loops may select the same queued row before either loop
+    reaches the network call. A plain read-then-write transition lets both
+    loops send it. The conditional UPDATE below is the ownership boundary:
+    exactly one transaction can change a claimable status to ``sending``.
+    Stale ``sending`` rows are reclaimable only when their lease timestamp is
+    older than the caller's cutoff.
+    """
+    normalized_status = (current_status or "").strip().lower()
+    if normalized_status == "sending":
+        eligibility = _sa_and(
+            AgentMailBridgeDelivery.id == delivery_id,
+            AgentMailBridgeDelivery.status == "sending",
+            _sa_or(
+                AgentMailBridgeDelivery.updated_ts.is_(None),
+                AgentMailBridgeDelivery.updated_ts <= stale_cutoff,
+            ),
+        )
+    elif normalized_status in claimable_statuses:
+        eligibility = _sa_and(
+            AgentMailBridgeDelivery.id == delivery_id,
+            AgentMailBridgeDelivery.status == normalized_status,
+        )
+    else:
+        return None
+
+    claimed = await session.execute(
+        update(AgentMailBridgeDelivery)
+        .where(eligibility)
+        .values(
+            status="sending",
+            attempts=AgentMailBridgeDelivery.attempts + 1,
+            last_error="",
+            updated_ts=now,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    if int(getattr(claimed, "rowcount", 0) or 0) != 1:
+        # End the read transaction so the caller does not retain a stale
+        # SQLite snapshot while another flusher owns the delivery.
+        await session.rollback()
+        return None
+
+    await session.commit()
+    refreshed = await session.execute(
+        select(AgentMailBridgeDelivery)
+        .where(AgentMailBridgeDelivery.id == delivery_id)
+        .execution_options(populate_existing=True)
+    )
+    return refreshed.scalars().first()
+
+
 async def _flush_bridge_deliveries_once(
     *,
     dest_host: str = "",
@@ -4823,12 +4885,19 @@ async def _flush_bridge_deliveries_once(
                 processed += 1
                 continue
 
-            current.status = "sending"
-            current.attempts += 1
-            current.last_error = ""
-            current.updated_ts = now
-            session.add(current)
-            await session.commit()
+            claimed = await _claim_bridge_delivery_for_send(
+                session,
+                delivery_id=int(current.id),
+                current_status=current_status,
+                claimable_statuses=wanted_statuses,
+                stale_cutoff=stale_cutoff,
+                now=now,
+            )
+            if claimed is None:
+                # Another flusher won the conditional claim, so it owns the
+                # network call and this worker must not send a duplicate.
+                continue
+            current = claimed
             delivery_snapshot = _bridge_delivery_dict(current)
             peer_api_url = peer.api_url.strip()
             peer_host_key = peer.host_key
