@@ -4604,7 +4604,6 @@ async def _queue_bridge_deliveries(
 
 
 async def _claim_bridge_delivery_for_send(
-    session: Any,
     *,
     delivery_id: int,
     current_status: str,
@@ -4639,30 +4638,32 @@ async def _claim_bridge_delivery_for_send(
     else:
         return None
 
-    claimed = await session.execute(
-        update(AgentMailBridgeDelivery)
-        .where(eligibility)
-        .values(
-            status="sending",
-            attempts=AgentMailBridgeDelivery.attempts + 1,
-            last_error="",
-            updated_ts=now,
+    # Use a fresh BEGIN IMMEDIATE transaction for the ownership transition.
+    # If two ordinary read transactions tried to upgrade their snapshots,
+    # SQLite could report SQLITE_BUSY_SNAPSHOT to the loser. Serializing only
+    # this short claim transaction makes contention resolve as rowcount=0.
+    async with get_immediate_session() as claim_session:
+        claimed = await claim_session.execute(
+            update(AgentMailBridgeDelivery)
+            .where(eligibility)
+            .values(
+                status="sending",
+                attempts=AgentMailBridgeDelivery.attempts + 1,
+                last_error="",
+                updated_ts=now,
+            )
+            .execution_options(synchronize_session=False)
         )
-        .execution_options(synchronize_session=False)
-    )
-    if int(getattr(claimed, "rowcount", 0) or 0) != 1:
-        # End the read transaction so the caller does not retain a stale
-        # SQLite snapshot while another flusher owns the delivery.
-        await session.rollback()
-        return None
+        if int(getattr(claimed, "rowcount", 0) or 0) != 1:
+            await claim_session.rollback()
+            return None
 
-    await session.commit()
-    refreshed = await session.execute(
-        select(AgentMailBridgeDelivery)
-        .where(AgentMailBridgeDelivery.id == delivery_id)
-        .execution_options(populate_existing=True)
-    )
-    return refreshed.scalars().first()
+        await claim_session.commit()
+        refreshed = await claim_session.execute(
+            select(AgentMailBridgeDelivery)
+            .where(AgentMailBridgeDelivery.id == delivery_id)
+        )
+        return refreshed.scalars().first()
 
 
 async def _flush_bridge_deliveries_once(
@@ -4886,7 +4887,6 @@ async def _flush_bridge_deliveries_once(
                 continue
 
             claimed = await _claim_bridge_delivery_for_send(
-                session,
                 delivery_id=int(current.id),
                 current_status=current_status,
                 claimable_statuses=wanted_statuses,
