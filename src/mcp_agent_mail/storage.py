@@ -730,8 +730,19 @@ class AsyncFileLock:
             _ACTIVE_LOCK_INSTANCES[id(self)] = self
 
     def __del__(self) -> None:
-        with _LOCK_INSTANCES_GUARD:
-            _ACTIVE_LOCK_INSTANCES.pop(id(self), None)
+        # Destructors can run while module globals are being torn down.  A
+        # cleanup exception here is both noisy and capable of masking the
+        # real shutdown failure, so make registry removal best-effort and
+        # explicitly safe during interpreter finalization.
+        try:
+            registry = globals().get("_ACTIVE_LOCK_INSTANCES")
+            guard = globals().get("_LOCK_INSTANCES_GUARD")
+            if registry is None or guard is None:
+                return
+            with guard:
+                registry.pop(id(self), None)
+        except Exception:
+            return
 
     def _force_close_fd(self) -> bool:
         """Force-close the underlying SoftFileLock file descriptor if still open.

@@ -2204,7 +2204,99 @@ _CANONICAL_BRIDGE_AGENT_BY_HOST = {
     "datacube": "PurpleCanyon",
     "primus": "RoseStone",
 }
+_CANONICAL_BRIDGE_PROJECT_BY_HOST = {
+    "datacube": "/home/Antigravity",
+    "primus": "/home/Antigravity",
+}
 _STALE_BRIDGE_AGENTS = {"swiftcat", "greenstone", "mister-fixit"}
+_BRIDGE_ENVELOPE_MARKER_RE = re.compile(r"(?im)^\s*<!--\s*ag-bridge-id:\s*([^>\s]+)\s*-->\s*$")
+_BRIDGE_ENVELOPE_HEADER_RE = re.compile(
+    r"(?im)^\s*Cross-system request from\s+(?P<host>[A-Za-z0-9_.:-]+)\s+"
+    r"agent\s+`(?P<agent>[^`]+)`\s+to\s+`(?P<recipient>[^`]+)`\s*\.\s*$"
+)
+
+
+def _canonicalize_bridge_project_key(host_key: str, project_key: str) -> str:
+    """Normalize the known shared project path without rewriting other projects."""
+    normalized_host = _normalize_bridge_host(host_key)
+    candidate = str(project_key or "").strip()
+    canonical = _CANONICAL_BRIDGE_PROJECT_BY_HOST.get(normalized_host)
+    if canonical and candidate.casefold() == canonical.casefold():
+        return canonical
+    return candidate
+
+
+def _bridge_envelope_provenance(body_md: str) -> dict[str, str] | None:
+    """Parse the trusted cross-host envelope header, if this is a bridge payload."""
+    body = str(body_md or "")
+    markers = list(_BRIDGE_ENVELOPE_MARKER_RE.finditer(body))
+    headers = list(_BRIDGE_ENVELOPE_HEADER_RE.finditer(body))
+    if not markers and not headers:
+        return None
+    if len(markers) != 1 or len(headers) != 1:
+        raise ToolExecutionError(
+            "MALFORMED_BRIDGE_ENVELOPE",
+            "A bridge envelope requires exactly one bridge marker and one parseable provenance header.",
+            recoverable=True,
+            data={"marker_count": len(markers), "header_count": len(headers)},
+        )
+    marker = markers[0]
+    header = headers[0]
+    return {
+        "bridge_id": marker.group(1).strip(),
+        "source_host": header.group("host").strip(),
+        "source_agent": header.group("agent").strip(),
+        "recipient": header.group("recipient").strip(),
+    }
+
+
+def _validate_bridge_envelope_provenance(
+    body_md: str,
+    *,
+    source_host: str,
+    source_agent: str,
+    expected_recipients: Sequence[str] | None = None,
+) -> dict[str, str] | None:
+    """Ensure human-readable bridge text cannot contradict transport metadata."""
+    provenance = _bridge_envelope_provenance(body_md)
+    if provenance is None:
+        return None
+    _validate_bridge_peer_identity(
+        provenance["source_host"],
+        provenance["source_agent"],
+        require_canonical=True,
+        context="bridge envelope source",
+    )
+    if (
+        _normalize_bridge_host(provenance["source_host"]) != _normalize_bridge_host(source_host)
+        or provenance["source_agent"].casefold() != source_agent.casefold()
+    ):
+        raise ToolExecutionError(
+            "BRIDGE_SOURCE_PROVENANCE_MISMATCH",
+            "Bridge envelope text does not match the authenticated transport source.",
+            recoverable=False,
+            data={
+                "transport_source_host": source_host,
+                "transport_source_agent": source_agent,
+                "envelope_source_host": provenance["source_host"],
+                "envelope_source_agent": provenance["source_agent"],
+                "bridge_id": provenance["bridge_id"],
+            },
+        )
+    if expected_recipients is not None:
+        normalized_recipients = {str(item).strip().casefold() for item in expected_recipients}
+        if provenance["recipient"].casefold() not in normalized_recipients:
+            raise ToolExecutionError(
+                "BRIDGE_RECIPIENT_PROVENANCE_MISMATCH",
+                "Bridge envelope text does not match the authenticated local recipient.",
+                recoverable=False,
+                data={
+                    "envelope_recipient": provenance["recipient"],
+                    "transport_recipients": sorted(normalized_recipients),
+                    "bridge_id": provenance["bridge_id"],
+                },
+            )
+    return provenance
 
 
 def _validate_bridge_peer_identity(
@@ -4288,7 +4380,7 @@ async def _upsert_remote_identity_record(
     now = _naive_utc()
     normalized_host = host_key.strip()
     normalized_agent = agent_name.strip()
-    normalized_project = remote_project_key.strip()
+    normalized_project = _canonicalize_bridge_project_key(normalized_host, remote_project_key)
     if not normalized_host or not normalized_agent:
         raise ToolExecutionError(
             "INVALID_ARGUMENT",
@@ -4625,6 +4717,7 @@ async def _flush_bridge_deliveries_once(
                 processed += 1
                 continue
             remote_project_key = current.dest_project_key.strip() or peer.project_key.strip()
+            remote_project_key = _canonicalize_bridge_project_key(peer.host_key, remote_project_key)
             if not remote_project_key:
                 blocked_error = "destination project_key is not configured"
                 if current.status == "blocked" and current.last_error == blocked_error:
@@ -4737,6 +4830,8 @@ async def _flush_bridge_deliveries_once(
             if isinstance(remote_payload, dict):
                 remote_message_id = str(remote_payload.get("id") or "")
                 duplicate = bool(remote_payload.get("duplicate"))
+            if not remote_message_id:
+                raise RuntimeError("peer bridge_receive_message returned no durable message receipt")
             async with get_session() as session:
                 current_result = await session.execute(
                     select(AgentMailBridgeDelivery).where(AgentMailBridgeDelivery.id == delivery.id)
@@ -7684,6 +7779,23 @@ def build_mcp_server() -> FastMCP:
         """
         project = await _get_project_by_identifier(project_key)
 
+        # A cross-host envelope must enter through bridge_receive_message.  If
+        # it is accepted by ordinary send_message, the local bridge/link agent
+        # becomes the apparent sender and the remote provenance is lost.
+        bridge_provenance = _bridge_envelope_provenance(body_md)
+        if bridge_provenance is not None:
+            raise ToolExecutionError(
+                "BRIDGE_ENVELOPE_REQUIRES_PROVENANCE",
+                "Cross-system Agent Mail envelopes must use bridge_receive_message with authenticated transport provenance.",
+                recoverable=True,
+                data={
+                    "bridge_id": bridge_provenance["bridge_id"],
+                    "source_host": bridge_provenance["source_host"],
+                    "source_agent": bridge_provenance["source_agent"],
+                    "required_tool": "bridge_receive_message",
+                },
+            )
+
         # Validate topic format if provided
         if topic is not None:
             import re as _re
@@ -8716,6 +8828,7 @@ def build_mcp_server() -> FastMCP:
                 )
         else:
             normalized_protocol_version = None
+        normalized_project_key = _canonicalize_bridge_project_key(normalized_host, project_key)
         await ensure_schema()
         now = _naive_utc()
         async with get_session() as session:
@@ -8735,7 +8848,7 @@ def build_mcp_server() -> FastMCP:
                 peer.created_ts = now
             peer.display_name = display_name or peer.display_name or normalized_host
             peer.api_url = api_url.strip()
-            peer.project_key = project_key.strip()
+            peer.project_key = normalized_project_key
             if auth_token:
                 peer.auth_token_hash = _hash_bridge_token(auth_token)
             peer.enabled = enabled
@@ -8769,12 +8882,13 @@ def build_mcp_server() -> FastMCP:
             agent_name,
             project_key=remote_project_key,
             require_project=True,
+            require_canonical=True,
             context="remote identity",
         )
         identity = await _upsert_remote_identity_record(
             host_key=host_key,
             agent_name=agent_name,
-            remote_project_key=remote_project_key,
+            remote_project_key=_canonicalize_bridge_project_key(host_key, remote_project_key),
             program=program,
             model=model,
             capabilities=capabilities or [],
@@ -8823,7 +8937,7 @@ def build_mcp_server() -> FastMCP:
             raise ToolExecutionError("INVALID_ARGUMENT", "to must contain at least one local agent name.", recoverable=True)
         source_host = source_host.strip()
         source_agent = source_agent.strip()
-        source_project_key = str(source_project_key or "").strip()
+        source_project_key = _canonicalize_bridge_project_key(source_host, str(source_project_key or ""))
         if not source_host or not source_agent:
             raise ToolExecutionError(
                 "INVALID_ARGUMENT",
@@ -8835,7 +8949,14 @@ def build_mcp_server() -> FastMCP:
             source_agent,
             project_key=source_project_key,
             require_project=True,
+            require_canonical=True,
             context="inbound bridge source",
+        )
+        _validate_bridge_envelope_provenance(
+            body_md,
+            source_host=source_host,
+            source_agent=source_agent,
+            expected_recipients=to,
         )
         invalid_local_targets = [
             str(item).strip()
@@ -9111,6 +9232,7 @@ def build_mcp_server() -> FastMCP:
                 "bcc": [],
             }
         )
+        notification_errors: list[str] = []
         if settings.notifications.enabled:
             message_meta = {
                 "id": message.id,
@@ -9120,8 +9242,20 @@ def build_mcp_server() -> FastMCP:
                 "source_host": source_host,
             }
             for agent in recipient_map.values():
-                with suppress(Exception):
+                try:
                     await emit_notification_signal(settings, project.slug, agent.name, message_meta)
+                except Exception as exc:
+                    error_text = f"{type(exc).__name__}: {str(exc)[:512]}"
+                    notification_errors.append(f"{agent.name}: {error_text}")
+                    logger.exception("Agent Mail bridge notification failed for %s", agent.name)
+        if notification_errors:
+            payload["notification_state"] = "failed_after_persist"
+            payload["notification_errors"] = notification_errors
+            await ctx.info(
+                f"Bridge message {message.id} persisted, but {len(notification_errors)} notification signal(s) failed."
+            )
+        else:
+            payload["notification_state"] = "delivered" if settings.notifications.enabled else "disabled"
         _schedule_memory_fabric_mail_mirror(
             settings,
             project,
