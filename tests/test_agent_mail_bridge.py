@@ -1240,6 +1240,49 @@ async def test_bridge_rejects_stale_and_blank_federated_identities(isolated_env,
 
 
 @pytest.mark.asyncio
+async def test_bridge_rejects_unknown_canonical_host_before_persistence(isolated_env, monkeypatch):
+    monkeypatch.setenv("AGENT_MAIL_HOST_KEY", "Datacube")
+    server = build_mcp_server()
+    async with Client(server) as client:
+        await client.call_tool("ensure_project", {"human_key": "/home/Antigravity"})
+        await client.call_tool(
+            "register_agent",
+            {
+                "project_key": "/home/Antigravity",
+                "program": "workx",
+                "model": "local",
+                "name": "PurpleCanyon",
+            },
+        )
+        failed = await client.call_tool_mcp(
+            "bridge_receive_message",
+            {
+                "project_key": "/home/Antigravity",
+                "to": ["PurpleCanyon"],
+                "subject": "Unknown source host",
+                "body_md": "must fail closed",
+                "source_host": "UntrustedHost",
+                "source_agent": "RoseStone",
+                "source_project_key": "/home/Antigravity",
+                "peer_token": "test-unknown-peer-token",
+                "external_message_id": "unknown-host-1",
+                "bridge_dedupe_id": "unknown-host:unknown-host-1",
+            },
+        )
+
+        error_text = " ".join(getattr(content, "text", "") for content in failed.content)
+        assert failed.isError is True
+        assert "only canonical bridge hosts are accepted" in error_text
+        async with get_session() as session:
+            count = (
+                await session.execute(
+                    text("SELECT COUNT(*) FROM messages WHERE subject = 'Unknown source host'")
+                )
+            ).scalar_one()
+        assert count == 0
+
+
+@pytest.mark.asyncio
 async def test_bridge_rejects_stale_body_provenance_before_persist(isolated_env, monkeypatch):
     monkeypatch.setenv("AGENT_MAIL_HOST_KEY", "Datacube")
     server = build_mcp_server()

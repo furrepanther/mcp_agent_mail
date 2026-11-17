@@ -2325,13 +2325,25 @@ def _validate_bridge_peer_identity(
             data={"host_key": host_key, "agent_name": normalized_agent},
         )
     expected_agent = _CANONICAL_BRIDGE_AGENT_BY_HOST.get(normalized_host)
-    if require_canonical and expected_agent and lowered_agent != expected_agent.casefold():
-        raise ToolExecutionError(
-            "INVALID_BRIDGE_IDENTITY",
-            f"{context} for {host_key} must use {expected_agent}, not {normalized_agent}.",
-            recoverable=True,
-            data={"host_key": host_key, "expected_agent": expected_agent, "agent_name": normalized_agent},
-        )
+    if require_canonical:
+        if expected_agent is None:
+            raise ToolExecutionError(
+                "UNKNOWN_BRIDGE_HOST",
+                f"{context} uses unknown host '{host_key}'; only canonical bridge hosts are accepted.",
+                recoverable=True,
+                data={
+                    "host_key": host_key,
+                    "known_hosts": sorted(_CANONICAL_BRIDGE_AGENT_BY_HOST),
+                    "agent_name": normalized_agent,
+                },
+            )
+        if lowered_agent != expected_agent.casefold():
+            raise ToolExecutionError(
+                "INVALID_BRIDGE_IDENTITY",
+                f"{context} for {host_key} must use {expected_agent}, not {normalized_agent}.",
+                recoverable=True,
+                data={"host_key": host_key, "expected_agent": expected_agent, "agent_name": normalized_agent},
+            )
     normalized_project = str(project_key or "").strip()
     if require_project and not normalized_project:
         raise ToolExecutionError(
