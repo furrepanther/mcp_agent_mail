@@ -104,6 +104,42 @@ except Exception:  # pragma: no cover - optional dependency fallback
 logger = logging.getLogger(__name__)
 
 
+def _is_machine_coordination_notice(
+    payload: Mapping[str, Any],
+    body_md: str,
+) -> bool:
+    """Keep watchdog coordination mail out of durable memory mirroring.
+
+    Agent Mail remains the authoritative archive and delivery path for these
+    messages. The repeated Primus outage/restored shares are operational
+    coordination artifacts, not durable user memory, and their changing share
+    IDs make them bypass content deduplication.
+    """
+    subject = str(payload.get("subject") or "").strip().lower()
+    body = str(body_md or "").lower()
+    text = f"{subject}\n{body}"
+    has_cross_system_share = bool(
+        re.search(r"(?:ag-share-id|agshare:primus:)", text, flags=re.IGNORECASE)
+    )
+    if not has_cross_system_share:
+        return False
+
+    if re.search(r"primus core service (?:outage|restored):", text):
+        return True
+
+    # Preserve human/executable cross-system work orders. Only the explicit
+    # non-executable coordination contract is filtered by this fallback.
+    non_executable = any(
+        marker in text
+        for marker in (
+            "agent-mail-control: executable=false",
+            "artifact_route_reason: agent_mail_long_memory_writes_disabled",
+            "informational cross-system coordination",
+        )
+    )
+    return non_executable and "executable=true" not in text
+
+
 async def _mirror_message_to_memory_fabric(
     settings: Settings,
     project: Project,
@@ -113,6 +149,12 @@ async def _mirror_message_to_memory_fabric(
     body_md: str,
 ) -> None:
     if not settings.memory_fabric_mirror_enabled:
+        return
+    if _is_machine_coordination_notice(payload, body_md):
+        logger.info(
+            "memory_fabric.mail_mirror_skipped reason=machine_coordination_notice subject=%r",
+            str(payload.get("subject") or "").strip(),
+        )
         return
 
     def _store() -> None:
@@ -168,6 +210,12 @@ def _schedule_memory_fabric_mail_mirror(
     body_md: str,
 ) -> None:
     if not settings.memory_fabric_mirror_enabled:
+        return
+    if _is_machine_coordination_notice(payload, body_md):
+        logger.info(
+            "memory_fabric.mail_mirror_skipped reason=machine_coordination_notice subject=%r",
+            str(payload.get("subject") or "").strip(),
+        )
         return
     task = asyncio.create_task(
         _mirror_message_to_memory_fabric(settings, project, sender, recipients, payload, body_md)
