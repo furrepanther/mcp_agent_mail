@@ -55,7 +55,7 @@ async def test_name_at_host_queues_remote_delivery(isolated_env, monkeypatch):
                 "project_key": "/home/Antigravity",
                 "program": "codex",
                 "model": "gpt-5",
-                "name": "RoseStone",
+                "name": "PurpleCanyon",
             },
         )
 
@@ -63,7 +63,7 @@ async def test_name_at_host_queues_remote_delivery(isolated_env, monkeypatch):
             "send_message",
             {
                 "project_key": "/home/Antigravity",
-                "sender_name": "RoseStone",
+                "sender_name": "PurpleCanyon",
                 "to": ["RoseStone@Primus"],
                 "subject": "Bridge smoke",
                 "body_md": "queued body",
@@ -108,7 +108,7 @@ async def test_reply_to_bridged_message_routes_to_remote_sender_and_preserves_th
                 "project_key": "/home/Antigravity",
                 "program": "codex",
                 "model": "gpt-5",
-                "name": "RoseStone",
+                "name": "PurpleCanyon",
             },
         )
         await client.call_tool(
@@ -125,7 +125,7 @@ async def test_reply_to_bridged_message_routes_to_remote_sender_and_preserves_th
             "bridge_receive_message",
             {
                 "project_key": "/home/Antigravity",
-                "to": ["RoseStone"],
+                "to": ["PurpleCanyon"],
                 "subject": "Remote work order",
                 "body_md": "Please verify the bridge reply path.",
                 "source_host": "Primus",
@@ -144,7 +144,7 @@ async def test_reply_to_bridged_message_routes_to_remote_sender_and_preserves_th
             {
                 "project_key": "/home/Antigravity",
                 "message_id": inbound.data["id"],
-                "sender_name": "RoseStone",
+                "sender_name": "PurpleCanyon",
                 "body_md": reply_body,
             },
         )
@@ -186,7 +186,7 @@ async def test_bridge_receive_without_remote_project_fails_closed(isolated_env, 
                 "project_key": "/home/Antigravity",
                 "program": "codex",
                 "model": "gpt-5",
-                "name": "RoseStone",
+                "name": "PurpleCanyon",
             },
         )
         await client.call_tool(
@@ -203,7 +203,7 @@ async def test_bridge_receive_without_remote_project_fails_closed(isolated_env, 
             "bridge_receive_message",
             {
                 "project_key": "/home/Antigravity",
-                "to": ["RoseStone"],
+                "to": ["PurpleCanyon"],
                 "subject": "Remote work order without project provenance",
                 "body_md": "This input intentionally omits source_project_key.",
                 "source_host": "Primus",
@@ -276,7 +276,8 @@ async def test_bridge_receive_preserves_remote_provenance(isolated_env, monkeypa
             },
         )
         inbox_items = _tool_list(inbox)
-        assert inbox_items[0]["from"] == "AmberGrove"
+        assert inbox_items[0]["from"] == "PurpleCanyon@Datacube"
+        assert inbox_items[0]["bridge_agent"] == "RoseStone"
         assert inbox_items[0]["external_sender"]["name"] == "PurpleCanyon"
         assert inbox_items[0]["external_sender"]["host"] == "Datacube"
 
@@ -838,7 +839,7 @@ async def test_bridge_flush_refuses_source_body_mutated_after_queue(isolated_env
                 "project_key": "/home/Antigravity",
                 "program": "codex",
                 "model": "gpt-5",
-                "name": "RoseStone",
+                "name": "PurpleCanyon",
             },
         )
         await client.call_tool(
@@ -855,7 +856,7 @@ async def test_bridge_flush_refuses_source_body_mutated_after_queue(isolated_env
             "send_message",
             {
                 "project_key": "/home/Antigravity",
-                "sender_name": "RoseStone",
+                "sender_name": "PurpleCanyon",
                 "to": ["RoseStone@Primus"],
                 "subject": "Queued body mutation",
                 "body_md": "original queued body",
@@ -900,7 +901,7 @@ async def test_bridge_flush_blocks_attested_delivery_for_legacy_peer(isolated_en
                 "project_key": "/home/Antigravity",
                 "program": "codex",
                 "model": "gpt-5",
-                "name": "RoseStone",
+                "name": "PurpleCanyon",
             },
         )
         # The default protocol version is deliberately legacy/unknown.
@@ -917,7 +918,7 @@ async def test_bridge_flush_blocks_attested_delivery_for_legacy_peer(isolated_en
             "send_message",
             {
                 "project_key": "/home/Antigravity",
-                "sender_name": "RoseStone",
+                "sender_name": "PurpleCanyon",
                 "to": ["RoseStone@Primus"],
                 "subject": "Attested must not downgrade",
                 "body_md": "attested body",
@@ -992,7 +993,7 @@ async def test_flush_migrated_legacy_delivery_uses_legacy_wire_shape(isolated_en
                     bridge_id="migrated-legacy-bridge",
                     local_message_id=legacy.data["id"],
                     source_host="Datacube",
-                    source_agent="RoseStone",
+                    source_agent="PurpleCanyon",
                     source_project_key="/home/Antigravity",
                     dest_host="Primus",
                     dest_agent="RoseStone",
@@ -1025,7 +1026,7 @@ async def test_bridge_rejects_remote_export_of_cross_origin_supersession(isolate
     server = build_mcp_server()
     async with Client(server) as client:
         await client.call_tool("ensure_project", {"human_key": "/home/Antigravity"})
-        for name in ("RoseStone", "AmberGrove"):
+        for name in ("RoseStone", "PurpleCanyon", "AmberGrove"):
             await client.call_tool(
                 "register_agent",
                 {
@@ -1068,7 +1069,7 @@ async def test_bridge_rejects_remote_export_of_cross_origin_supersession(isolate
             "send_message",
             {
                 "project_key": "/home/Antigravity",
-                "sender_name": "RoseStone",
+                "sender_name": "PurpleCanyon",
                 "to": ["RoseStone@Primus"],
                 "subject": "Local correction",
                 "body_md": "local correction body",
@@ -1557,6 +1558,71 @@ async def test_flush_requires_durable_peer_receipt_and_recovers(isolated_env, mo
 
 
 @pytest.mark.asyncio
+async def test_flush_blocks_stale_queued_destination_before_network(isolated_env, monkeypatch):
+    monkeypatch.setenv("AGENT_MAIL_HOST_KEY", "Datacube")
+    calls = []
+
+    async def fake_call_bridge_peer_tool(**kwargs):
+        calls.append(kwargs)
+        return {"id": "must-not-be-called"}
+
+    monkeypatch.setattr(app_module, "_call_bridge_peer_tool", fake_call_bridge_peer_tool)
+    server = build_mcp_server()
+    async with Client(server) as client:
+        await client.call_tool("ensure_project", {"human_key": "/home/Antigravity"})
+        await client.call_tool(
+            "register_agent",
+            {
+                "project_key": "/home/Antigravity",
+                "program": "workx",
+                "model": "local",
+                "name": "PurpleCanyon",
+            },
+        )
+        await client.call_tool(
+            "upsert_bridge_peer",
+            {
+                "host_key": "Primus",
+                "auth_token": "test-primus-peer-token",
+                "api_url": "http://127.0.0.1:18766/api/",
+                "project_key": "/home/Antigravity",
+                "bridge_protocol_version": 1,
+            },
+        )
+        sent = await client.call_tool(
+            "send_message",
+            {
+                "project_key": "/home/Antigravity",
+                "sender_name": "PurpleCanyon",
+                "to": ["RoseStone@Primus"],
+                "subject": "Stale queued destination",
+                "body_md": "must be quarantined before transport",
+            },
+        )
+        bridge_id = sent.data["bridge_deliveries"][0]["bridge_id"]
+        async with get_session() as session:
+            await session.execute(
+                text(
+                    "UPDATE agent_mail_bridge_deliveries "
+                    "SET dest_agent = 'SwiftCat' WHERE bridge_id = :bridge_id"
+                ),
+                {"bridge_id": bridge_id},
+            )
+            await session.commit()
+
+        blocked = await client.call_tool("flush_bridge_deliveries", {"limit": 1})
+        assert blocked.data["blocked"] == 1
+        assert blocked.data["delivered"] == 0
+        assert calls == []
+        assert blocked.data["results"][0]["status"] == "blocked"
+        assert "STALE_BRIDGE_IDENTITY" in blocked.data["results"][0]["last_error"]
+
+        second = await client.call_tool("flush_bridge_deliveries", {"limit": 1})
+        assert second.data["processed"] == 0
+        assert calls == []
+
+
+@pytest.mark.asyncio
 async def test_flush_bridge_deliveries_pushes_to_configured_peer(isolated_env, monkeypatch):
     monkeypatch.setenv("AGENT_MAIL_HOST_KEY", "Datacube")
     calls = []
@@ -1575,7 +1641,7 @@ async def test_flush_bridge_deliveries_pushes_to_configured_peer(isolated_env, m
                 "project_key": "/home/Antigravity",
                 "program": "codex",
                 "model": "gpt-5",
-                "name": "RoseStone",
+                "name": "PurpleCanyon",
             },
         )
         await client.call_tool(
@@ -1592,7 +1658,7 @@ async def test_flush_bridge_deliveries_pushes_to_configured_peer(isolated_env, m
             "send_message",
             {
                 "project_key": "/home/Antigravity",
-                "sender_name": "RoseStone",
+                "sender_name": "PurpleCanyon",
                 "to": ["RoseStone@Primus"],
                 "subject": "Bridge flush",
                 "body_md": "deliver body",
@@ -1615,7 +1681,7 @@ async def test_flush_bridge_deliveries_pushes_to_configured_peer(isolated_env, m
         assert args["project_key"] == "/home/Antigravity"
         assert args["to"] == ["RoseStone"]
         assert args["source_host"] == "Datacube"
-        assert args["source_agent"] == "RoseStone"
+        assert args["source_agent"] == "PurpleCanyon"
         assert args["bridge_id"] == bridge_id
         assert args["bridge_dedupe_id"] == f"Datacube:{local_message_id}:Primus:RoseStone"
         assert args["body_sha256"] == snapshot["body_sha256"]

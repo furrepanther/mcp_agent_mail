@@ -2208,7 +2208,7 @@ _CANONICAL_BRIDGE_PROJECT_BY_HOST = {
     "datacube": "/home/Antigravity",
     "primus": "/home/Antigravity",
 }
-_STALE_BRIDGE_AGENTS = {"swiftcat", "greenstone", "mister-fixit"}
+_STALE_BRIDGE_AGENTS = {"swiftcat", "greenstone", "mister-fixit", "ambergrove", "tealcove"}
 _BRIDGE_ENVELOPE_MARKER_RE = re.compile(r"(?im)^\s*<!--\s*ag-bridge-id:\s*([^>\s]+)\s*-->\s*$")
 _BRIDGE_ENVELOPE_HEADER_RE = re.compile(
     r"(?im)^\s*Cross-system request from\s+(?P<host>[A-Za-z0-9_.:-]+)\s+"
@@ -2340,6 +2340,28 @@ def _validate_bridge_peer_identity(
             recoverable=True,
             data={"host_key": host_key, "agent_name": normalized_agent},
         )
+
+
+def _canonical_local_bridge_agent_name(override: str | None = None) -> str:
+    """Resolve the local bridge identity without accepting stale configuration."""
+    host_key = _agent_mail_host_key()
+    expected_agent = _CANONICAL_BRIDGE_AGENT_BY_HOST.get(_normalize_bridge_host(host_key))
+    if not expected_agent:
+        raise ToolExecutionError(
+            "UNKNOWN_LOCAL_BRIDGE_HOST",
+            "The local host is not mapped to a canonical bridge identity; set AGENT_MAIL_HOST_KEY explicitly.",
+            recoverable=True,
+            data={"host_key": host_key},
+        )
+    configured = str(override or os.getenv("AGENT_MAIL_BRIDGE_AGENT_NAME", "") or "").strip()
+    if configured and configured.casefold() != expected_agent.casefold():
+        raise ToolExecutionError(
+            "INVALID_LOCAL_BRIDGE_IDENTITY",
+            f"The local bridge identity for {host_key} must be {expected_agent}, not {configured}.",
+            recoverable=True,
+            data={"host_key": host_key, "expected_agent": expected_agent, "configured_agent": configured},
+        )
+    return expected_agent
 
 
 def _public_peer_dict(peer: AgentMailPeer) -> dict[str, Any]:
@@ -4443,6 +4465,14 @@ async def _queue_bridge_deliveries(
     await ensure_schema()
     now = _naive_utc()
     source_host = _agent_mail_host_key()
+    _validate_bridge_peer_identity(
+        source_host,
+        sender.name,
+        project_key=project.human_key,
+        require_project=True,
+        require_canonical=True,
+        context="outbound bridge source",
+    )
     queued: list[dict[str, Any]] = []
     async with get_session() as session:
         if local_message_id is None:
@@ -4651,6 +4681,33 @@ async def _flush_bridge_deliveries_once(
                 session.add(current)
                 await session.commit()
                 results.append({**_bridge_delivery_dict(current), "transport_state": "failed"})
+                processed += 1
+                continue
+            try:
+                _validate_bridge_peer_identity(
+                    current.source_host,
+                    current.source_agent,
+                    project_key=current.source_project_key,
+                    require_project=True,
+                    require_canonical=True,
+                    context="queued bridge source",
+                )
+                _validate_bridge_peer_identity(
+                    current.dest_host,
+                    current.dest_agent,
+                    require_canonical=True,
+                    context="queued bridge destination",
+                )
+            except ToolExecutionError as exc:
+                blocked_error = f"{exc.error_type}: {exc}"
+                if current.status == "blocked" and current.last_error == blocked_error:
+                    continue
+                current.status = "blocked"
+                current.last_error = blocked_error
+                current.updated_ts = now
+                session.add(current)
+                await session.commit()
+                results.append({**_bridge_delivery_dict(current), "transport_state": "blocked"})
                 processed += 1
                 continue
             snapshot_digest = getattr(current, "body_sha256", None)
@@ -5481,7 +5538,13 @@ async def _list_inbox(
     messages: list[dict[str, Any]] = []
     for message, recipient_kind, sender_name in rows:
         payload = _message_to_dict(message, include_body=include_bodies)
-        payload["from"] = sender_name
+        external_sender_host = str(getattr(message, "external_sender_host", "") or "").strip()
+        external_sender_name = str(getattr(message, "external_sender_name", "") or "").strip()
+        if external_sender_host and external_sender_name:
+            payload["from"] = f"{external_sender_name}@{external_sender_host}"
+            payload["bridge_agent"] = sender_name
+        else:
+            payload["from"] = sender_name
         payload["kind"] = recipient_kind
         messages.append(payload)
     return messages
@@ -9109,7 +9172,7 @@ def build_mcp_server() -> FastMCP:
             remote_project_key=source_project_key,
             status="active",
         )
-        local_bridge_agent_name = bridge_agent_name or os.getenv("AGENT_MAIL_BRIDGE_AGENT_NAME", "AmberGrove")
+        local_bridge_agent_name = _canonical_local_bridge_agent_name(bridge_agent_name)
         bridge_agent = await _get_or_create_agent(
             project,
             local_bridge_agent_name,
