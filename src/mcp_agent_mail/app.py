@@ -2161,21 +2161,10 @@ def _message_to_dict(message: Message, include_body: bool = True) -> dict[str, A
 
 
 def _agent_mail_host_key() -> str:
-    raw = (
-        os.getenv("AGENT_MAIL_HOST_KEY", "")
-        or os.getenv("ANTIGRAVITY_PLATFORM_ID", "")
-        or os.getenv("AG_PLATFORM_ID", "")
-        or ""
-    ).strip()
-    if raw:
-        return raw
-    hostname = os.uname().nodename if hasattr(os, "uname") else ""
-    lowered = hostname.lower()
-    if lowered.startswith("datacube"):
-        return "Datacube"
-    if lowered.startswith("primus"):
-        return "Primus"
-    return hostname or "local"
+    # Host identity is a routing/security boundary.  Never infer it from
+    # inherited platform variables or the machine hostname: those values can
+    # drift across WSL restarts and silently select the wrong peer identity.
+    return os.getenv("AGENT_MAIL_HOST_KEY", "").strip()
 
 
 def _normalize_bridge_host(value: str) -> str:

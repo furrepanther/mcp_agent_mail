@@ -91,6 +91,38 @@ async def test_name_at_host_queues_remote_delivery(isolated_env, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_remote_send_requires_explicit_host_pin(isolated_env, monkeypatch):
+    monkeypatch.delenv("AGENT_MAIL_HOST_KEY", raising=False)
+    monkeypatch.delenv("ANTIGRAVITY_PLATFORM_ID", raising=False)
+    monkeypatch.delenv("AG_PLATFORM_ID", raising=False)
+    server = build_mcp_server()
+    async with Client(server) as client:
+        await client.call_tool("ensure_project", {"human_key": "/home/Antigravity"})
+        await client.call_tool(
+            "register_agent",
+            {
+                "project_key": "/home/Antigravity",
+                "program": "codex",
+                "model": "gpt-5",
+                "name": "PurpleCanyon",
+            },
+        )
+        failed = await client.call_tool_mcp(
+            "send_message",
+            {
+                "project_key": "/home/Antigravity",
+                "sender_name": "PurpleCanyon",
+                "to": ["RoseStone@Primus"],
+                "subject": "Implicit identity must fail",
+                "body_md": "The host pin is intentionally absent.",
+            },
+        )
+        assert failed.isError is True
+        error_text = " ".join(getattr(content, "text", "") for content in failed.content)
+        assert "outbound bridge source requires a non-empty host" in error_text
+
+
+@pytest.mark.asyncio
 async def test_reply_to_bridged_message_routes_to_remote_sender_and_preserves_thread(isolated_env, monkeypatch):
     monkeypatch.setenv("AGENT_MAIL_HOST_KEY", "Datacube")
     calls = []
@@ -303,6 +335,7 @@ async def test_bridge_receive_preserves_remote_provenance(isolated_env, monkeypa
 
 @pytest.mark.asyncio
 async def test_bridge_receive_attested_digest_is_verified_and_idempotent(isolated_env, monkeypatch):
+    monkeypatch.setenv("AGENT_MAIL_HOST_KEY", "Datacube")
     error_types = []
 
     def capture_tool_error(_tool_name, error):
@@ -558,7 +591,8 @@ async def test_schema_migrates_existing_sqlite_bridge_and_message_tables(isolate
 
 
 @pytest.mark.asyncio
-async def test_bridge_revision_lineage_is_scoped_to_project_and_remote_provenance(isolated_env):
+async def test_bridge_revision_lineage_is_scoped_to_project_and_remote_provenance(isolated_env, monkeypatch):
+    monkeypatch.setenv("AGENT_MAIL_HOST_KEY", "Datacube")
     server = build_mcp_server()
     async with Client(server) as client:
         await _upsert_peer(client, "Datacube", "test-datacube-peer-token")
@@ -628,7 +662,8 @@ async def test_bridge_revision_lineage_is_scoped_to_project_and_remote_provenanc
 
 
 @pytest.mark.asyncio
-async def test_bridge_dedupe_scope_prevents_cross_project_remote_collision(isolated_env):
+async def test_bridge_dedupe_scope_prevents_cross_project_remote_collision(isolated_env, monkeypatch):
+    monkeypatch.setenv("AGENT_MAIL_HOST_KEY", "Datacube")
     server = build_mcp_server()
     async with Client(server) as client:
         await _upsert_peer(client, "Datacube", "test-datacube-peer-token")
@@ -692,6 +727,7 @@ async def test_bridge_dedupe_scope_prevents_cross_project_remote_collision(isola
 
 @pytest.mark.asyncio
 async def test_bridge_receive_concurrent_idempotent_retry_rereads_scoped_duplicate(isolated_env, monkeypatch):
+    monkeypatch.setenv("AGENT_MAIL_HOST_KEY", "Datacube")
     server = build_mcp_server()
     original_create_message = app_module._create_message
     injected_race = False
@@ -742,7 +778,8 @@ async def test_bridge_receive_concurrent_idempotent_retry_rereads_scoped_duplica
 
 
 @pytest.mark.asyncio
-async def test_legacy_history_can_be_superseded_but_not_retroactively_attested(isolated_env):
+async def test_legacy_history_can_be_superseded_but_not_retroactively_attested(isolated_env, monkeypatch):
+    monkeypatch.setenv("AGENT_MAIL_HOST_KEY", "Datacube")
     server = build_mcp_server()
     async with Client(server) as client:
         await _upsert_peer(client, "Datacube", "test-datacube-peer-token")
@@ -1092,7 +1129,8 @@ async def test_bridge_rejects_remote_export_of_cross_origin_supersession(isolate
 
 
 @pytest.mark.asyncio
-async def test_bridge_receive_peer_token_enforced_when_configured(isolated_env):
+async def test_bridge_receive_peer_token_enforced_when_configured(isolated_env, monkeypatch):
+    monkeypatch.setenv("AGENT_MAIL_HOST_KEY", "Datacube")
     server = build_mcp_server()
     async with Client(server) as client:
         await client.call_tool("ensure_project", {"human_key": "/home/antigravity"})
