@@ -1,6 +1,7 @@
 """Tests for tool filtering and push notification features."""
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -197,6 +198,35 @@ class TestNotifications:
         assert data["message"]["id"] == 123
         assert data["message"]["subject"] == "Hello"
         assert data["message"]["importance"] == "high"
+
+    @pytest.mark.asyncio
+    async def test_emit_notification_signal_strict_surfaces_write_failure(
+        self, isolated_env, monkeypatch, tmp_path
+    ):
+        """The bridge can opt out of silent signal-write failures."""
+        from mcp_agent_mail.config import clear_settings_cache, get_settings
+        from mcp_agent_mail.storage import emit_notification_signal
+
+        signals_dir = tmp_path / "signals"
+        monkeypatch.setenv("NOTIFICATIONS_ENABLED", "true")
+        monkeypatch.setenv("NOTIFICATIONS_SIGNALS_DIR", str(signals_dir))
+        monkeypatch.setenv("NOTIFICATIONS_DEBOUNCE_MS", "0")
+        clear_settings_cache()
+        settings = get_settings()
+
+        def fail_write(*_args, **_kwargs):
+            raise OSError("signal directory unavailable")
+
+        monkeypatch.setattr(Path, "write_text", fail_write)
+
+        with pytest.raises(RuntimeError, match="notification signal emission failed"):
+            await emit_notification_signal(
+                settings,
+                "test_project",
+                "TestAgent",
+                {"id": 1},
+                strict=True,
+            )
 
     @pytest.mark.asyncio
     async def test_clear_notification_signal(self, isolated_env, monkeypatch, tmp_path):

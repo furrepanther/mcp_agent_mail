@@ -9387,7 +9387,13 @@ def build_mcp_server() -> FastMCP:
             }
             for agent in recipient_map.values():
                 try:
-                    await emit_notification_signal(settings, project.slug, agent.name, message_meta)
+                    await emit_notification_signal(
+                        settings,
+                        project.slug,
+                        agent.name,
+                        message_meta,
+                        strict=True,
+                    )
                 except Exception as exc:
                     error_text = f"{type(exc).__name__}: {str(exc)[:512]}"
                     notification_errors.append(f"{agent.name}: {error_text}")

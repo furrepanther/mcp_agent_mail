@@ -3278,6 +3278,8 @@ async def emit_notification_signal(
     project_slug: str,
     agent_name: str,
     message_metadata: dict[str, Any] | None = None,
+    *,
+    strict: bool = False,
 ) -> bool:
     """Emit a notification signal for an agent in a project.
 
@@ -3334,8 +3336,17 @@ async def emit_notification_signal(
     try:
         await _to_thread(_write_signal)
         return True
-    except Exception:
-        # Signal emission is best-effort; don't fail message delivery
+    except Exception as exc:
+        # Ordinary local notification callers retain best-effort behavior, but
+        # durable bridge delivery must distinguish a failed signal write from
+        # successful message persistence.  The bridge opts into strict mode
+        # and records the failure in its response/log path.
+        if strict:
+            raise RuntimeError(
+                f"notification signal emission failed for {project_slug}/{agent_name}"
+            ) from exc
+        # Signal emission is best-effort for non-bridge callers; don't fail
+        # ordinary message delivery.
         return False
 
 
