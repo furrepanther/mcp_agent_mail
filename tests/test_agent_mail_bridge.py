@@ -37,6 +37,27 @@ async def _upsert_peer(client, host_key, token, project_key="/peer-project"):
     )
 
 
+@pytest.mark.parametrize(
+    ("host_key", "agent_name", "expected_error"),
+    [
+        ("Primus", "SwiftCat", "STALE_BRIDGE_IDENTITY"),
+        ("Primus", "", "INVALID_BRIDGE_IDENTITY"),
+        ("", "RoseStone", "INVALID_BRIDGE_IDENTITY"),
+    ],
+)
+def test_bridge_identity_rejects_stale_or_blank_before_delivery(host_key, agent_name, expected_error):
+    """Stale and incomplete peer identities fail before network or persistence."""
+    with pytest.raises(app_module.ToolExecutionError) as exc_info:
+        app_module._validate_bridge_peer_identity(
+            host_key,
+            agent_name,
+            require_canonical=True,
+            context="test bridge identity",
+        )
+
+    assert exc_info.value.error_type == expected_error
+
+
 def test_parse_mcp_tool_payload_rejects_remote_tool_error():
     raw = '{"jsonrpc":"2.0","id":"1","result":{"isError":true,"content":[{"type":"text","text":"peer rejected bridge_receive_message"}]}}'
 
