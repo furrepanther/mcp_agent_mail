@@ -58,6 +58,19 @@ def test_bridge_identity_rejects_stale_or_blank_before_delivery(host_key, agent_
     assert exc_info.value.error_type == expected_error
 
 
+@pytest.mark.parametrize(
+    ("host_key", "project_key", "expected"),
+    [
+        ("Datacube", "/home/antigravity", "/home/Antigravity"),
+        ("Primus", "/home/Antigravity", "/home/antigravity"),
+        ("Primus", "/srv/other-project", "/srv/other-project"),
+    ],
+)
+def test_bridge_project_keys_are_canonical_per_host(host_key, project_key, expected):
+    """Federated project paths are host-local and must preserve case semantics."""
+    assert app_module._canonicalize_bridge_project_key(host_key, project_key) == expected
+
+
 def test_parse_mcp_tool_payload_rejects_remote_tool_error():
     raw = '{"jsonrpc":"2.0","id":"1","result":{"isError":true,"content":[{"type":"text","text":"peer rejected bridge_receive_message"}]}}'
 
@@ -1844,7 +1857,7 @@ async def test_flush_bridge_deliveries_pushes_to_configured_peer(isolated_env, m
         assert calls[0]["api_url"] == "http://127.0.0.1:18766/api/"
         assert calls[0]["tool_name"] == "bridge_receive_message"
         args = calls[0]["arguments"]
-        assert args["project_key"] == "/home/Antigravity"
+        assert args["project_key"] == "/home/antigravity"
         assert args["to"] == ["RoseStone"]
         assert args["source_host"] == "Datacube"
         assert args["source_agent"] == "PurpleCanyon"

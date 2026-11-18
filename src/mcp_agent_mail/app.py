@@ -2243,7 +2243,10 @@ _CANONICAL_BRIDGE_AGENT_BY_HOST = {
 }
 _CANONICAL_BRIDGE_PROJECT_BY_HOST = {
     "datacube": "/home/Antigravity",
-    "primus": "/home/Antigravity",
+    # Project keys are host-local absolute paths and Linux paths are
+    # case-sensitive.  Primus's canonical project is lower-case while
+    # Datacube's is the capitalized shared production path.
+    "primus": "/home/antigravity",
 }
 _STALE_BRIDGE_AGENTS = {"swiftcat", "greenstone", "mister-fixit", "ambergrove", "tealcove"}
 _BRIDGE_ENVELOPE_MARKER_RE = re.compile(r"(?im)^\s*<!--\s*ag-bridge-id:\s*([^>\s]+)\s*-->\s*$")
