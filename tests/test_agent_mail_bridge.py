@@ -71,6 +71,64 @@ def test_bridge_project_keys_are_canonical_per_host(host_key, project_key, expec
     assert app_module._canonicalize_bridge_project_key(host_key, project_key) == expected
 
 
+@pytest.mark.asyncio
+async def test_same_thread_participant_lookup_survives_session_scope(isolated_env, monkeypatch):
+    """Thread contact auto-allow must query recipients inside a live DB session."""
+    monkeypatch.setenv("AGENT_MAIL_HOST_KEY", "Datacube")
+    monkeypatch.setenv("CONTACT_ENFORCEMENT_ENABLED", "true")
+    monkeypatch.setenv("MESSAGING_AUTO_HANDSHAKE_ON_BLOCK", "false")
+    monkeypatch.setenv("CONTACT_AUTO_RETRY_ENABLED", "false")
+    monkeypatch.setenv("CONTACT_AUTO_TTL_SECONDS", "0")
+    from mcp_agent_mail.config import clear_settings_cache
+
+    clear_settings_cache()
+    server = build_mcp_server()
+    async with Client(server) as client:
+        await client.call_tool("ensure_project", {"human_key": "/thread-contacts"})
+        for name in ("GreenCastle", "BlueLake"):
+            await client.call_tool(
+                "register_agent",
+                {
+                    "project_key": "Thread-Contacts",
+                    "program": "workx",
+                    "model": "local",
+                    "name": name,
+                },
+            )
+        await client.call_tool(
+            "set_contact_policy",
+            {"project_key": "Thread-Contacts", "agent_name": "BlueLake", "policy": "open"},
+        )
+        seed = await client.call_tool(
+            "send_message",
+            {
+                "project_key": "Thread-Contacts",
+                "sender_name": "GreenCastle",
+                "to": ["BlueLake"],
+                "subject": "Seed",
+                "body_md": "thread seed",
+            },
+        )
+        payload = (seed.data.get("deliveries") or [])[0]["payload"]
+        thread_id = payload.get("thread_id") or payload["id"]
+        await client.call_tool(
+            "set_contact_policy",
+            {"project_key": "Thread-Contacts", "agent_name": "BlueLake", "policy": "contacts_only"},
+        )
+        followup = await client.call_tool(
+            "send_message",
+            {
+                "project_key": "Thread-Contacts",
+                "sender_name": "GreenCastle",
+                "to": ["BlueLake"],
+                "subject": "Thread follow-up",
+                "body_md": "participant lookup remains available",
+                "thread_id": str(thread_id),
+            },
+        )
+        assert (followup.data.get("deliveries") or [])[0]["payload"]["subject"] == "Thread follow-up"
+
+
 def test_parse_mcp_tool_payload_rejects_remote_tool_error():
     raw = '{"jsonrpc":"2.0","id":"1","result":{"isError":true,"content":[{"type":"text","text":"peer rejected bridge_receive_message"}]}}'
 
