@@ -47,8 +47,9 @@ async def test_unknown_recipient_reports_structured_error(isolated_env):
                 },
             )
 
-        # Retrieve again via non-raising call — implementation may auto-handshake;
-        # accept either structured error or success
+        # Retrieve again via non-raising call and require a structured
+        # recipient failure. An invalid identity must never surface as a raw
+        # KeyError or an ambiguous transport error.
         res = await client.call_tool_mcp(
             "send_message",
             {
@@ -59,14 +60,10 @@ async def test_unknown_recipient_reports_structured_error(isolated_env):
                 "body_md": "testing unknown recipient",
             },
         )
-        if res.isError:
-            # structured error path
-            text = " ".join(getattr(c, "text", "") for c in res.content)
-            assert "BlueLake" in text
-        else:
-            # success path (auto-handshake)
-            text = " ".join(getattr(c, "text", "") for c in res.content)
-            assert "deliveries" in text
+        assert res.isError is True
+        text = " ".join(getattr(c, "text", "") for c in res.content)
+        assert "BlueLake" in text
+        assert "KeyError" not in text
 
         # Register and ensure sanitized inputs (hyphen stripped/lowercased) route
         await client.call_tool(

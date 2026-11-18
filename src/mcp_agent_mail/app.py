@@ -2204,11 +2204,11 @@ def _partition_bridge_recipients(recipients: Sequence[str], kind: str) -> tuple[
                     recoverable=True,
                 )
             if agent_name:
-                _validate_bridge_peer_identity(
-                    _agent_mail_host_key(),
-                    agent_name,
-                    context="local recipient",
-                )
+                # An unqualified name is an ordinary recipient in the current
+                # project. Bridge identity validation applies only to an
+                # explicitly qualified Agent@Host address; applying it here
+                # would reject every normal local agent when the host pin is
+                # absent or when the local agent is not the bridge persona.
                 local.append(agent_name)
             continue
         if _is_local_bridge_host(host_key):
@@ -6369,6 +6369,22 @@ def build_mcp_server() -> FastMCP:
         bcc_names = _unique(bcc_names)
         combined_names = [*to_names, *cc_names, *bcc_names]
         agent_map = await _get_agents_batch(project, combined_names)
+        # Keep the delivery boundary fail-closed even if the batch lookup is
+        # changed or a concurrent identity mutation returns a partial map.
+        # A raw KeyError here bypasses the message-delivery contract and makes
+        # an invalid recipient look like a transport crash.
+        missing_names = [name for name in combined_names if name not in agent_map]
+        if missing_names:
+            raise ToolExecutionError(
+                "RECIPIENT_NOT_FOUND",
+                "Agent Mail recipient(s) were not found in the project: "
+                + ", ".join(repr(name) for name in missing_names),
+                recoverable=True,
+                data={
+                    "project": project.human_key,
+                    "recipients": missing_names,
+                },
+            )
         to_agents = [agent_map[name] for name in to_names]
         cc_agents = [agent_map[name] for name in cc_names]
         bcc_agents = [agent_map[name] for name in bcc_names]
