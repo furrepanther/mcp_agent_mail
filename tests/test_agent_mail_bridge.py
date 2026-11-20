@@ -71,6 +71,16 @@ def test_bridge_project_keys_are_canonical_per_host(host_key, project_key, expec
     assert app_module._canonicalize_bridge_project_key(host_key, project_key) == expected
 
 
+def test_outbound_peer_token_never_uses_unscoped_fallback(monkeypatch):
+    """A generic token must not cross an accidentally renamed peer boundary."""
+    monkeypatch.delenv("AGENT_MAIL_BRIDGE_PEER_TOKEN_PRIMUS", raising=False)
+    monkeypatch.delenv("ANTIGRAVITY_AGENT_MAIL_BRIDGE_PEER_TOKEN_PRIMUS", raising=False)
+    monkeypatch.setenv("AGENT_MAIL_BRIDGE_PEER_TOKEN", "wrong-peer-token")
+    monkeypatch.setenv("ANTIGRAVITY_AGENT_MAIL_BRIDGE_PEER_TOKEN", "another-wrong-peer-token")
+
+    assert app_module._bridge_outbound_peer_token("Primus") == ""
+
+
 @pytest.mark.asyncio
 async def test_same_thread_participant_lookup_survives_session_scope(isolated_env, monkeypatch):
     """Thread contact auto-allow must query recipients inside a live DB session."""
@@ -1836,6 +1846,7 @@ async def test_flush_blocks_stale_queued_destination_before_network(isolated_env
                 "body_md": "must be quarantined before transport",
             },
         )
+        assert sent.data["bridge_deliveries"][0]["dest_project_key"] == "/home/antigravity"
         bridge_id = sent.data["bridge_deliveries"][0]["bridge_id"]
         async with get_session() as session:
             await session.execute(
@@ -1853,6 +1864,71 @@ async def test_flush_blocks_stale_queued_destination_before_network(isolated_env
         assert calls == []
         assert blocked.data["results"][0]["status"] == "blocked"
         assert "STALE_BRIDGE_IDENTITY" in blocked.data["results"][0]["last_error"]
+
+        second = await client.call_tool("flush_bridge_deliveries", {"limit": 1})
+        assert second.data["processed"] == 0
+        assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_flush_blocks_blank_queued_destination_project_before_network(isolated_env, monkeypatch):
+    monkeypatch.setenv("AGENT_MAIL_HOST_KEY", "Datacube")
+    calls = []
+
+    async def fake_call_bridge_peer_tool(**kwargs):
+        calls.append(kwargs)
+        return {"id": "must-not-be-called"}
+
+    monkeypatch.setattr(app_module, "_call_bridge_peer_tool", fake_call_bridge_peer_tool)
+    server = build_mcp_server()
+    async with Client(server) as client:
+        await client.call_tool("ensure_project", {"human_key": "/home/Antigravity"})
+        await client.call_tool(
+            "register_agent",
+            {
+                "project_key": "/home/Antigravity",
+                "program": "workx",
+                "model": "local",
+                "name": "PurpleCanyon",
+            },
+        )
+        await client.call_tool(
+            "upsert_bridge_peer",
+            {
+                "host_key": "Primus",
+                "auth_token": "test-primus-peer-token",
+                "api_url": "http://127.0.0.1:18766/api/",
+                "project_key": "/home/antigravity",
+                "bridge_protocol_version": 1,
+            },
+        )
+        sent = await client.call_tool(
+            "send_message",
+            {
+                "project_key": "/home/Antigravity",
+                "sender_name": "PurpleCanyon",
+                "to": ["RoseStone@Primus"],
+                "subject": "Blank queued project",
+                "body_md": "must be quarantined before transport",
+            },
+        )
+        bridge_id = sent.data["bridge_deliveries"][0]["bridge_id"]
+        async with get_session() as session:
+            await session.execute(
+                text(
+                    "UPDATE agent_mail_bridge_deliveries "
+                    "SET dest_project_key = '' WHERE bridge_id = :bridge_id"
+                ),
+                {"bridge_id": bridge_id},
+            )
+            await session.commit()
+
+        blocked = await client.call_tool("flush_bridge_deliveries", {"limit": 1})
+        assert blocked.data["blocked"] == 1
+        assert blocked.data["delivered"] == 0
+        assert calls == []
+        assert blocked.data["results"][0]["status"] == "blocked"
+        assert "BLANK_BRIDGE_PROJECT" in blocked.data["results"][0]["last_error"]
 
         second = await client.call_tool("flush_bridge_deliveries", {"limit": 1})
         assert second.data["processed"] == 0

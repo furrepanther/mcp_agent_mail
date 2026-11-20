@@ -2503,6 +2503,12 @@ def _bridge_delivery_dict(delivery: AgentMailBridgeDelivery) -> dict[str, Any]:
 
 
 def _bridge_peer_token_env_names(host_key: str) -> list[str]:
+    """Return only the host-scoped outbound token names.
+
+    An unscoped fallback lets a token intended for one peer authenticate a
+    different peer after a host-name or deployment drift.  Missing host
+    scope must fail closed at the delivery boundary instead.
+    """
     normalized = re.sub(r"[^A-Za-z0-9]+", "_", host_key.strip()).strip("_").upper()
     names = []
     if normalized:
@@ -2512,7 +2518,6 @@ def _bridge_peer_token_env_names(host_key: str) -> list[str]:
                 f"ANTIGRAVITY_AGENT_MAIL_BRIDGE_PEER_TOKEN_{normalized}",
             ]
         )
-    names.extend(["AGENT_MAIL_BRIDGE_PEER_TOKEN", "ANTIGRAVITY_AGENT_MAIL_BRIDGE_PEER_TOKEN"])
     return names
 
 
@@ -4587,6 +4592,24 @@ async def _queue_bridge_deliveries(
             host_key = recipient["host_key"].strip()
             agent_name = recipient["agent_name"].strip()
             dest_project_key = str(recipient.get("dest_project_key", "") or "").strip()
+            if not dest_project_key:
+                # A bare canonical recipient such as RoseStone@Primus is
+                # allowed at the API boundary, but the durable delivery must
+                # never rely on a later peer-default fallback.  Resolve the
+                # host-local canonical project before the row is committed so
+                # every queued delivery is self-describing.
+                dest_project_key = _CANONICAL_BRIDGE_PROJECT_BY_HOST.get(
+                    _normalize_bridge_host(host_key),
+                    "",
+                )
+            dest_project_key = _canonicalize_bridge_project_key(host_key, dest_project_key)
+            if not dest_project_key:
+                raise ToolExecutionError(
+                    "INVALID_BRIDGE_PROJECT",
+                    "A bridge delivery requires a non-empty destination project key.",
+                    recoverable=True,
+                    data={"dest_host": host_key, "dest_agent": agent_name},
+                )
             identity_result = await session.execute(
                 select(AgentMailRemoteIdentity).where(
                     func.lower(AgentMailRemoteIdentity.host_key) == host_key.lower(),
@@ -4888,10 +4911,15 @@ async def _flush_bridge_deliveries_once(
                 results.append({**_bridge_delivery_dict(current), "transport_state": "blocked"})
                 processed += 1
                 continue
-            remote_project_key = current.dest_project_key.strip() or peer.project_key.strip()
-            remote_project_key = _canonicalize_bridge_project_key(peer.host_key, remote_project_key)
+            # Do not silently repair an already-persisted blank project from
+            # mutable peer configuration.  Such a row is historical drift and
+            # must be durably quarantined instead of being sent ambiguously.
+            remote_project_key = _canonicalize_bridge_project_key(
+                peer.host_key,
+                current.dest_project_key.strip(),
+            )
             if not remote_project_key:
-                blocked_error = "destination project_key is not configured"
+                blocked_error = "BLANK_BRIDGE_PROJECT: destination project_key is not recorded"
                 if current.status == "blocked" and current.last_error == blocked_error:
                     continue
                 current.status = "blocked"
