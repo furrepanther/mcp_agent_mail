@@ -5623,6 +5623,8 @@ async def _list_inbox(
     urgent_only: bool,
     include_bodies: bool,
     since_ts: Optional[str],
+    before_ts: Optional[str] = None,
+    before_id: Optional[int] = None,
     topic: Optional[str] = None,
     unread_only: bool = False,
 ) -> list[dict[str, Any]]:
@@ -5639,7 +5641,9 @@ async def _list_inbox(
                 cast(Any, Message.project_id) == project.id,
                 MessageRecipient.agent_id == agent.id,
             )
-            .order_by(desc(Message.created_ts))
+            # The ID tie-breaker makes the cursor a strict total order when
+            # several messages share a timestamp.
+            .order_by(desc(Message.created_ts), desc(Message.id))
             .limit(limit)
         )
         if urgent_only:
@@ -5648,6 +5652,21 @@ async def _list_inbox(
             since_dt = _parse_iso(since_ts)
             if since_dt:
                 stmt = stmt.where(Message.created_ts > _naive_utc(since_dt))
+        if before_ts:
+            before_dt = _parse_iso(before_ts)
+            if before_dt:
+                if before_id is None:
+                    stmt = stmt.where(Message.created_ts < _naive_utc(before_dt))
+                else:
+                    stmt = stmt.where(
+                        _sa_or(
+                            Message.created_ts < _naive_utc(before_dt),
+                            _sa_and(
+                                Message.created_ts == _naive_utc(before_dt),
+                                Message.id < before_id,
+                            ),
+                        )
+                    )
         if topic:
             stmt = stmt.where(cast(Any, func.lower(Message.topic)) == topic.lower())
         if unread_only:
@@ -10297,6 +10316,8 @@ def build_mcp_server() -> FastMCP:
         urgent_only: bool = False,
         include_bodies: bool = False,
         since_ts: Optional[str] = None,
+        before_ts: Optional[str] = None,
+        before_id: Optional[int] = None,
         topic: Optional[str] = None,
         unread_only: bool = False,
         registration_token: Optional[str] = None,
@@ -10309,6 +10330,8 @@ def build_mcp_server() -> FastMCP:
         -------
         - `urgent_only`: only messages with importance in {high, urgent}
         - `since_ts`: ISO-8601 timestamp string; messages strictly newer than this are returned
+        - `before_ts` and `before_id`: exclusive keyset boundary for fetching older
+          messages. Both are required together when paging a full result window.
         - `limit`: max number of messages (default 20)
         - `include_bodies`: include full Markdown bodies in the payloads
         - `topic`: filter to messages with this topic tag
@@ -10347,6 +10370,30 @@ def build_mcp_server() -> FastMCP:
 
         # Validate since_ts format upfront with helpful error message
         _validate_iso_timestamp(since_ts, "since_ts")
+        _validate_iso_timestamp(before_ts, "before_ts")
+        if before_id is not None and (
+            isinstance(before_id, bool) or not isinstance(before_id, int) or before_id < 1
+        ):
+            raise ToolExecutionError(
+                error_type="INVALID_BEFORE_ID",
+                message=f"before_id must be a positive integer, got {before_id!r}.",
+                recoverable=True,
+                data={"provided": before_id},
+            )
+        if before_id is not None and not before_ts:
+            raise ToolExecutionError(
+                error_type="INVALID_CURSOR",
+                message="before_id requires before_ts so the keyset boundary is unambiguous.",
+                recoverable=True,
+                data={"argument": "before_id"},
+            )
+        if before_ts and before_id is None:
+            raise ToolExecutionError(
+                error_type="INVALID_CURSOR",
+                message="before_ts requires before_id so the keyset boundary is unambiguous.",
+                recoverable=True,
+                data={"argument": "before_ts"},
+            )
 
         settings = get_settings()
         if settings.tools_log_enabled:
@@ -10376,6 +10423,8 @@ def build_mcp_server() -> FastMCP:
                 urgent_only,
                 include_bodies,
                 since_ts,
+                before_ts,
+                before_id,
                 topic=topic,
                 unread_only=unread_only,
             )
