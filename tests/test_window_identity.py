@@ -10,12 +10,14 @@ Covers:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 
 import pytest
 from fastmcp import Client
 
+import mcp_agent_mail.app as app_module
 from mcp_agent_mail.app import build_mcp_server
 from mcp_agent_mail.utils import validate_agent_name_format
 
@@ -95,6 +97,44 @@ async def test_window_id_reused_on_subsequent_registration(isolated_env, monkeyp
         assert name1 == name2, "Same window UUID should produce same agent name"
         assert result2.data.get("window_id") == window_uuid
         logger.debug("Window identity reused: uuid=%s, name=%s", window_uuid, name1)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_first_registration_reuses_winning_window_name(isolated_env, monkeypatch):
+    """Concurrent first registration must not create a second name for one window."""
+    window_uuid = str(uuid.uuid4())
+    monkeypatch.setenv("MCP_AGENT_MAIL_WINDOW_ID", window_uuid)
+
+    from mcp_agent_mail.config import clear_settings_cache
+
+    clear_settings_cache()
+    server = build_mcp_server()
+    async with Client(server) as client:
+        await client.call_tool("ensure_project", {"human_key": "/test/window-race"})
+
+    project = await app_module._get_project_by_identifier("/test/window-race")
+    settings = app_module.get_settings()
+    generated_names = iter(("BlueLake", "GreenCastle"))
+    original_create = app_module._create_window_identity
+    create_barrier = asyncio.Barrier(2)
+
+    async def deterministic_name(*args, **kwargs):
+        return next(generated_names)
+
+    async def synchronized_create(*args, **kwargs):
+        await create_barrier.wait()
+        return await original_create(*args, **kwargs)
+
+    monkeypatch.setattr(app_module, "_generate_unique_agent_name", deterministic_name)
+    monkeypatch.setattr(app_module, "_create_window_identity", synchronized_create)
+
+    first, second = await asyncio.gather(
+        app_module._get_or_create_agent(project, None, "worker-a", "model", "first", settings),
+        app_module._get_or_create_agent(project, None, "worker-b", "model", "second", settings),
+    )
+
+    assert first.name == second.name
+    assert first.name in {"BlueLake", "GreenCastle"}
 
 
 @pytest.mark.asyncio

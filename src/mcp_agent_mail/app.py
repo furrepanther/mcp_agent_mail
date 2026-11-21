@@ -3968,6 +3968,15 @@ async def _get_or_create_agent(
                 window_identity = await _create_window_identity(
                     project, window_uuid, desired_name, ttl_days,
                 )
+                # A concurrent caller may have won the unique
+                # (project_id, window_uuid) insert while this call was
+                # generating its name.  _create_window_identity returns the
+                # winning row in that case; use its canonical display name
+                # and treat it as an idempotent identity, rather than
+                # creating a second agent for the losing caller's stale
+                # generated name.
+                desired_name = window_identity.display_name
+                explicit_name_used = True
     else:
         # Priority 4: no name, no window ID -> auto-generate
         desired_name = await _generate_unique_agent_name(project, settings, None)
