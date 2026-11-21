@@ -51,6 +51,8 @@ def test_memory_fabric_mirror_loader_is_path_isolated_and_singleton(tmp_path):
     assert all(module is modules[0] for module in modules)
     assert modules[0].Marker.value == "loaded-from-explicit-path"
     assert sys.path == before
+    module_name = app_module._memory_fabric_client_module_name(str(module_path.resolve()))
+    assert module_name not in sys.modules
 
 
 def test_memory_fabric_mirror_loader_cache_is_bounded_and_clearable(tmp_path):
@@ -64,6 +66,10 @@ def test_memory_fabric_mirror_loader_cache_is_bounded_and_clearable(tmp_path):
             encoding="utf-8",
         )
         app_module._load_memory_fabric_mirror_client_module(str(module_dir))
+        module_name = app_module._memory_fabric_client_module_name(
+            str((module_dir / "memfab_mcp_client.py").resolve())
+        )
+        assert module_name not in sys.modules
 
     assert len(app_module._MEMORY_FABRIC_CLIENT_MODULE_CACHE) <= app_module._MEMORY_FABRIC_CLIENT_MODULE_CACHE_MAX
     app_module._clear_memory_fabric_mirror_client_module_cache()

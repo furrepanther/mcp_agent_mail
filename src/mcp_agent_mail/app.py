@@ -162,6 +162,12 @@ def _load_memory_fabric_mirror_client_module(client_lib: str) -> Any:
         sys.modules[module_name] = module
         try:
             spec.loader.exec_module(module)
+            # The module only needs to be visible while exec_module runs.  Do
+            # not leave a private cache entry in process-global sys.modules;
+            # eviction or shutdown must never remove a name another loader
+            # happens to be using.
+            with suppress(BaseException):
+                sys.modules.pop(module_name, None)
             while len(_MEMORY_FABRIC_CLIENT_MODULE_CACHE) >= _MEMORY_FABRIC_CLIENT_MODULE_CACHE_MAX:
                 evicted_key, _ = _MEMORY_FABRIC_CLIENT_MODULE_CACHE.popitem(last=False)
                 sys.modules.pop(_memory_fabric_client_module_name(evicted_key), None)
