@@ -23,7 +23,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections import defaultdict, deque
+from collections import OrderedDict, defaultdict, deque
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
@@ -108,8 +108,25 @@ except Exception:  # pragma: no cover - optional dependency fallback
 
 logger = logging.getLogger(__name__)
 
-_MEMORY_FABRIC_CLIENT_MODULE_CACHE: dict[str, Any] = {}
+_MEMORY_FABRIC_CLIENT_MODULE_CACHE: OrderedDict[str, Any] = OrderedDict()
+_MEMORY_FABRIC_CLIENT_MODULE_CACHE_MAX = 8
 _MEMORY_FABRIC_CLIENT_MODULE_LOCK = threading.Lock()
+
+
+def _memory_fabric_client_module_name(cache_key: str) -> str:
+    return (
+        "_mcp_agent_mail_memfab_client_"
+        + hashlib.sha256(cache_key.encode("utf-8")).hexdigest()[:16]
+    )
+
+
+def _clear_memory_fabric_mirror_client_module_cache() -> None:
+    """Release dynamically loaded mirror modules during server shutdown."""
+    with _MEMORY_FABRIC_CLIENT_MODULE_LOCK:
+        cache_keys = tuple(_MEMORY_FABRIC_CLIENT_MODULE_CACHE)
+        _MEMORY_FABRIC_CLIENT_MODULE_CACHE.clear()
+        for cache_key in cache_keys:
+            sys.modules.pop(_memory_fabric_client_module_name(cache_key), None)
 
 
 def _load_memory_fabric_mirror_client_module(client_lib: str) -> Any:
@@ -132,12 +149,10 @@ def _load_memory_fabric_mirror_client_module(client_lib: str) -> Any:
     with _MEMORY_FABRIC_CLIENT_MODULE_LOCK:
         cached = _MEMORY_FABRIC_CLIENT_MODULE_CACHE.get(cache_key)
         if cached is not None:
+            _MEMORY_FABRIC_CLIENT_MODULE_CACHE.move_to_end(cache_key)
             return cached
 
-        module_name = (
-            "_mcp_agent_mail_memfab_client_"
-            + hashlib.sha256(cache_key.encode("utf-8")).hexdigest()[:16]
-        )
+        module_name = _memory_fabric_client_module_name(cache_key)
         spec = importlib.util.spec_from_file_location(module_name, source_path)
         if spec is None or spec.loader is None:
             raise ImportError(f"unable to create import spec for {source_path}")
@@ -150,6 +165,9 @@ def _load_memory_fabric_mirror_client_module(client_lib: str) -> Any:
         except BaseException:
             sys.modules.pop(module_name, None)
             raise
+        while len(_MEMORY_FABRIC_CLIENT_MODULE_CACHE) >= _MEMORY_FABRIC_CLIENT_MODULE_CACHE_MAX:
+            evicted_key, _ = _MEMORY_FABRIC_CLIENT_MODULE_CACHE.popitem(last=False)
+            sys.modules.pop(_memory_fabric_client_module_name(evicted_key), None)
         _MEMORY_FABRIC_CLIENT_MODULE_CACHE[cache_key] = module
         return module
 
@@ -987,6 +1005,8 @@ def _lifespan_factory(settings: Settings) -> Callable[[FastMCP], AsyncContextMan
                 with suppress(BaseException):
                     if dispose_task.exception() is None:
                         clear_database_state()
+            with suppress(BaseException):
+                _clear_memory_fabric_mirror_client_module_cache()
             if cancelled is not None:
                 raise cancelled
 

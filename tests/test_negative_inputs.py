@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
@@ -15,6 +17,12 @@ def test_auto_handshake_default_is_fail_closed(monkeypatch):
     _config.clear_settings_cache()
     settings = _config.get_settings()
     assert settings.messaging_auto_handshake_on_block is False
+
+
+def test_send_message_handshake_call_sites_remain_fail_closed():
+    source = Path(__file__).parents[1].joinpath("src/mcp_agent_mail/app.py").read_text(encoding="utf-8")
+    assert 'getattr(settings_local, "messaging_auto_handshake_on_block", True)' not in source
+    assert source.count('getattr(settings_local, "messaging_auto_handshake_on_block", False)') == 2
 
 
 @pytest.mark.asyncio

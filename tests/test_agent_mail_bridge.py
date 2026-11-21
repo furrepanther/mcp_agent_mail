@@ -30,6 +30,8 @@ def test_memory_fabric_mirror_loader_is_path_isolated_and_singleton(tmp_path):
     """Concurrent mirrors must not race through process-global ``sys.path``."""
     module_path = tmp_path / "memfab_mcp_client.py"
     module_path.write_text(
+        "import time\n"
+        "time.sleep(0.02)\n"
         "class Marker:\n"
         "    value = 'loaded-from-explicit-path'\n"
         "\n"
@@ -49,6 +51,23 @@ def test_memory_fabric_mirror_loader_is_path_isolated_and_singleton(tmp_path):
     assert all(module is modules[0] for module in modules)
     assert modules[0].Marker.value == "loaded-from-explicit-path"
     assert sys.path == before
+
+
+def test_memory_fabric_mirror_loader_cache_is_bounded_and_clearable(tmp_path):
+    for index in range(app_module._MEMORY_FABRIC_CLIENT_MODULE_CACHE_MAX + 2):
+        module_dir = tmp_path / f"client-{index}"
+        module_dir.mkdir()
+        (module_dir / "memfab_mcp_client.py").write_text(
+            f"VALUE = {index}\n"
+            "def get_shared_memfab_client():\n"
+            "    return None\n",
+            encoding="utf-8",
+        )
+        app_module._load_memory_fabric_mirror_client_module(str(module_dir))
+
+    assert len(app_module._MEMORY_FABRIC_CLIENT_MODULE_CACHE) <= app_module._MEMORY_FABRIC_CLIENT_MODULE_CACHE_MAX
+    app_module._clear_memory_fabric_mirror_client_module_cache()
+    assert not app_module._MEMORY_FABRIC_CLIENT_MODULE_CACHE
 
 
 def test_attested_revision_one_preserves_legacy_supersession_compatibility():
