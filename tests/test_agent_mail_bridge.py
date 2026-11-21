@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import sqlite3
+import sys
 
 import pytest
 from fastmcp import Client
@@ -22,6 +24,44 @@ def _tool_list(result):
         if isinstance(structured, list):
             return structured
     return list(getattr(result, "data", result))
+
+
+def test_memory_fabric_mirror_loader_is_path_isolated_and_singleton(tmp_path):
+    """Concurrent mirrors must not race through process-global ``sys.path``."""
+    module_path = tmp_path / "memfab_mcp_client.py"
+    module_path.write_text(
+        "class Marker:\n"
+        "    value = 'loaded-from-explicit-path'\n"
+        "\n"
+        "def get_shared_memfab_client():\n"
+        "    return None\n",
+        encoding="utf-8",
+    )
+    before = list(sys.path)
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        modules = list(
+            pool.map(
+                app_module._load_memory_fabric_mirror_client_module,
+                [str(tmp_path)] * 8,
+            )
+        )
+
+    assert all(module is modules[0] for module in modules)
+    assert modules[0].Marker.value == "loaded-from-explicit-path"
+    assert sys.path == before
+
+
+def test_attested_revision_one_preserves_legacy_supersession_compatibility():
+    body = "root revision"
+    validated = app_module._validate_inbound_bridge_attestation(
+        body_md=body,
+        body_sha256=hashlib.sha256(body.encode("utf-8")).hexdigest(),
+        attestation_version=1,
+        message_revision=1,
+        supersedes_message_id="legacy-parent",
+    )
+
+    assert validated[2:] == (1, "legacy-parent")
 
 
 async def _upsert_peer(client, host_key, token, project_key="/peer-project"):
@@ -189,6 +229,104 @@ async def test_name_at_host_queues_remote_delivery(isolated_env, monkeypatch):
         assert any(
             item["host_key"] == "Primus" and item["agent_name"] == "RoseStone"
             for item in identities.data["remote"]
+        )
+
+
+@pytest.mark.asyncio
+async def test_external_delivery_failure_is_visible_and_other_targets_continue(isolated_env, monkeypatch):
+    """One failed project must not hide or abort another external delivery."""
+    monkeypatch.setenv("AGENT_MAIL_HOST_KEY", "Datacube")
+    server = build_mcp_server()
+    async with Client(server) as client:
+        for project_key in ("/source", "/target-a", "/target-b"):
+            await client.call_tool("ensure_project", {"human_key": project_key})
+        await client.call_tool(
+            "register_agent",
+            {
+                "project_key": "/source",
+                "program": "workx",
+                "model": "local",
+                "name": "PurpleCanyon",
+            },
+        )
+        for project_key, name in (("/target-a", "RoseStone"), ("/target-b", "TealCove")):
+            await client.call_tool(
+                "register_agent",
+                {
+                    "project_key": project_key,
+                    "program": "workx",
+                    "model": "local",
+                    "name": name,
+                },
+            )
+            await client.call_tool(
+                "macro_contact_handshake",
+                {
+                    "project_key": "/source",
+                    "requester": "PurpleCanyon",
+                    "target": name,
+                    "to_project": project_key,
+                    "auto_accept": True,
+                    "register_if_missing": False,
+                    "reason": "external delivery test",
+                },
+            )
+
+        real_get_or_create = app_module._get_or_create_agent
+
+        async def fail_target_a(project, *args, **kwargs):
+            if project.human_key == "/target-a":
+                raise OSError("target-a is unavailable")
+            return await real_get_or_create(project, *args, **kwargs)
+
+        monkeypatch.setattr(app_module, "_get_or_create_agent", fail_target_a)
+        sent = await client.call_tool(
+            "send_message",
+            {
+                "project_key": "/source",
+                "sender_name": "PurpleCanyon",
+                "to": ["project:/target-a#RoseStone", "project:/target-b#TealCove"],
+                "subject": "External failure visibility",
+                "body_md": "one target fails, the other must still receive the message",
+            },
+        )
+
+        assert sent.data["delivery_state"] == "partial_failure"
+        assert sent.data["delivery_errors"][0]["project"] == "/target-a"
+        assert sent.data["delivery_errors"][0]["error"]["type"] == "EXTERNAL_DELIVERY_FAILED"
+        assert sent.data["delivery_errors"][0]["error"]["message"] == "target-a is unavailable"
+        assert any(
+            item["project"] == "/target-b" and isinstance(item.get("payload"), dict)
+            for item in sent.data["deliveries"]
+        )
+
+        original = await client.call_tool(
+            "send_message",
+            {
+                "project_key": "/source",
+                "sender_name": "PurpleCanyon",
+                "to": ["PurpleCanyon"],
+                "subject": "Reply source",
+                "body_md": "reply source",
+            },
+        )
+        original_id = original.data["deliveries"][0]["payload"]["id"]
+        replied = await client.call_tool(
+            "reply_message",
+            {
+                "project_key": "/source",
+                "message_id": original_id,
+                "sender_name": "PurpleCanyon",
+                "to": ["project:/target-a#RoseStone", "project:/target-b#TealCove"],
+                "body_md": "reply also reports partial failure",
+            },
+        )
+
+        assert replied.data["delivery_state"] == "partial_failure"
+        assert replied.data["delivery_errors"][0]["project"] == "/target-a"
+        assert any(
+            item["project"] == "/target-b" and isinstance(item.get("payload"), dict)
+            for item in replied.data["deliveries"]
         )
 
 

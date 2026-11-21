@@ -9,6 +9,8 @@ import fnmatch
 import functools
 import hashlib
 import hmac
+import importlib
+import importlib.util
 import inspect
 import json
 import logging
@@ -19,6 +21,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from collections import defaultdict, deque
 from collections.abc import AsyncIterator, Sequence
@@ -103,6 +106,51 @@ except Exception:  # pragma: no cover - optional dependency fallback
 
 logger = logging.getLogger(__name__)
 
+_MEMORY_FABRIC_CLIENT_MODULE_CACHE: dict[str, Any] = {}
+_MEMORY_FABRIC_CLIENT_MODULE_LOCK = threading.Lock()
+
+
+def _load_memory_fabric_mirror_client_module(client_lib: str) -> Any:
+    """Load a configured memory-fabric client without mutating ``sys.path``.
+
+    The mail server can mirror messages from multiple async tasks.  Inserting a
+    task-specific directory into the process-global import path makes those
+    tasks race and can cause one task to import another task's client module.
+    Resolve the configured file explicitly and cache it by canonical path
+    instead.  The cache lock also makes first-load behavior deterministic when
+    mirrors start concurrently.
+    """
+    configured = Path(str(client_lib).strip()).expanduser()
+    source_path = configured / "memfab_mcp_client.py" if configured.is_dir() else configured
+    source_path = source_path.resolve()
+    if not source_path.is_file():
+        raise ImportError(f"memory fabric client module not found: {source_path}")
+
+    cache_key = str(source_path)
+    with _MEMORY_FABRIC_CLIENT_MODULE_LOCK:
+        cached = _MEMORY_FABRIC_CLIENT_MODULE_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
+        module_name = (
+            "_mcp_agent_mail_memfab_client_"
+            + hashlib.sha256(cache_key.encode("utf-8")).hexdigest()[:16]
+        )
+        spec = importlib.util.spec_from_file_location(module_name, source_path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"unable to create import spec for {source_path}")
+        module = importlib.util.module_from_spec(spec)
+        # Dataclasses and other module introspection expect the module to be
+        # visible while exec_module runs.  This is not an import-path mutation.
+        sys.modules[module_name] = module
+        try:
+            spec.loader.exec_module(module)
+        except BaseException:
+            sys.modules.pop(module_name, None)
+            raise
+        _MEMORY_FABRIC_CLIENT_MODULE_CACHE[cache_key] = module
+        return module
+
 
 def _is_machine_coordination_notice(
     payload: Mapping[str, Any],
@@ -159,9 +207,13 @@ async def _mirror_message_to_memory_fabric(
 
     def _store() -> None:
         client_lib = settings.memory_fabric_mirror_client_lib
-        if client_lib and client_lib not in sys.path:
-            sys.path.insert(0, client_lib)
-        from memfab_mcp_client import get_shared_memfab_client
+        if client_lib:
+            client_module = _load_memory_fabric_mirror_client_module(client_lib)
+        else:
+            # Preserve the installed-client fallback without changing the
+            # process-global import path.
+            client_module = importlib.import_module("memfab_mcp_client")
+        get_shared_memfab_client = client_module.get_shared_memfab_client
 
         created = str(payload.get("created_ts") or payload.get("created") or datetime.now(timezone.utc).isoformat())
         message_id = payload.get("id", "")
@@ -2121,6 +2173,11 @@ def _validate_inbound_bridge_attestation(
             "Attested bridge messages require message_revision >= 1.",
             recoverable=True,
         )
+    # Revision 1 may supersede a legacy (revision 0) message during the
+    # attestation migration.  The database-backed lineage check in
+    # bridge_receive_message rejects non-monotonic supersession when an
+    # attested parent is present; rejecting this shape here would break the
+    # supported legacy-to-attested upgrade path.
     if revision > 1 and supersedes is None:
         raise ToolExecutionError(
             "INVALID_BODY_ATTESTATION",
@@ -2128,6 +2185,46 @@ def _validate_inbound_bridge_attestation(
             recoverable=True,
         )
     return version, body_sha256, revision, supersedes
+
+
+def _external_delivery_failure(
+    *,
+    action: str,
+    project: Project,
+    exc: Exception,
+) -> dict[str, Any]:
+    """Return a bounded, machine-readable failure instead of hiding it."""
+    detail = str(exc).strip() or type(exc).__name__
+    if len(detail) > 500:
+        detail = detail[:497] + "..."
+    logger.exception(
+        "External %s delivery failed for project %r",
+        action,
+        project.human_key,
+    )
+    return {
+        "project": project.human_key,
+        "delivery_state": "failed",
+        "error": {
+            "type": "EXTERNAL_DELIVERY_FAILED",
+            "action": action,
+            "exception_type": type(exc).__name__,
+            "message": detail,
+            "recoverable": True,
+        },
+    }
+
+
+def _delivery_failure_summaries(deliveries: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Extract visible failure records without exposing arbitrary exceptions."""
+    return [
+        {
+            "project": item.get("project"),
+            "error": item.get("error"),
+        }
+        for item in deliveries
+        if item.get("delivery_state") == "failed" and isinstance(item.get("error"), Mapping)
+    ]
 
 
 def _message_to_dict(message: Message, include_body: bool = True) -> dict[str, Any]:
@@ -8402,7 +8499,7 @@ def build_mcp_server() -> FastMCP:
                 ]
                 attempted: list[str] = []
                 # Respect explicit flag or server default ergonomics
-                effective_auto_contact: bool = bool(auto_contact_if_blocked or getattr(settings_local, "messaging_auto_handshake_on_block", True))
+                effective_auto_contact: bool = bool(auto_contact_if_blocked or getattr(settings_local, "messaging_auto_handshake_on_block", False))
                 if effective_auto_contact:
                     try:
                         from fastmcp.tools.tool import FunctionTool
@@ -8418,6 +8515,11 @@ def build_mcp_server() -> FastMCP:
                                         "target": nm,
                                         "reason": "auto-handshake by send_message",
                                         "auto_accept": True,
+                                        # Automatic delivery recovery may not
+                                        # create a new identity.  A missing
+                                        # recipient is a routing/repair error,
+                                        # not permission to mint a persona.
+                                        "register_if_missing": False,
                                         "ttl_seconds": int(settings_local.contact_auto_ttl_seconds),
                                         "format": "json",
                                     }
@@ -8705,33 +8807,15 @@ def build_mcp_server() -> FastMCP:
                 ) from err
 
             if unknown_local or unknown_external:
-                # Auto-register missing local recipients if enabled
-                if getattr(settings_local, "messaging_auto_register_recipients", True):
-                    # Best effort: try to register any unknown local recipients with sane defaults
-                    newly_registered: set[str] = set()
-                    for missing in list(unknown_local):
-                        try:
-                            _ = await _get_or_create_agent(
-                                project,
-                                missing,
-                                sender.program,
-                                sender.model,
-                                sender.task_description,
-                                settings,
-                            )
-                            newly_registered.add(missing)
-                        except Exception:
-                            logger.exception("Failed to auto-register recipient %r in project %r", missing, project.human_key)
-                    unknown_local.difference_update(newly_registered)
-                    # Re-run routing for any that were registered
-                    if newly_registered:
-                        from contextlib import suppress
-                        with suppress(_ContactBlocked):
-                            await _route(list(newly_registered), "to")
+                # Automatic recipient registration is retired.  A missing
+                # recipient is a routing/provisioning defect, never a reason
+                # for send_message to mint another Agent Mail identity.  This
+                # intentionally ignores the legacy environment knob as well;
+                # a deployment override must not resurrect identity drift.
                 # Attempt cross-project handshakes for unknown external recipients if allowed
                 attempted_external: list[str] = []
                 try:
-                    effective_auto_contact = bool(auto_contact_if_blocked or getattr(settings_local, "messaging_auto_handshake_on_block", True))
+                    effective_auto_contact = bool(auto_contact_if_blocked or getattr(settings_local, "messaging_auto_handshake_on_block", False))
                     if effective_auto_contact and unknown_external:
                         from fastmcp.tools.tool import FunctionTool
                         handshake = cast(FunctionTool, cast(Any, macro_contact_handshake))
@@ -8754,7 +8838,10 @@ def build_mcp_server() -> FastMCP:
                                             "reason": "auto-handshake by send_message",
                                             "auto_accept": True,
                                             "ttl_seconds": int(settings_local.contact_auto_ttl_seconds),
-                                            "register_if_missing": True,
+                                            # Never mint a new bridge or peer
+                                            # identity as a side effect of a
+                                            # delivery retry or timeout.
+                                            "register_if_missing": False,
                                             "format": "json",
                                         }
                                     )
@@ -8929,9 +9016,16 @@ def build_mcp_server() -> FastMCP:
                     supersedes_message_id=supersedes_message_id,
                 )
                 deliveries.append({"project": p.human_key, "payload": payload_ext})
-            except Exception:
-                logger.exception("Failed to deliver message to external project %r", p.human_key)
-                continue
+            except Exception as exc:
+                # Keep processing other target projects, but never make a
+                # partial delivery look successful to the caller.
+                deliveries.append(
+                    _external_delivery_failure(
+                        action="send_message",
+                        project=p,
+                        exc=exc,
+                    )
+                )
 
         bridge_deliveries: list[dict[str, Any]] = []
         if remote_bridge_recipients:
@@ -8988,6 +9082,14 @@ def build_mcp_server() -> FastMCP:
             if isinstance(maybe_payload, dict) and isinstance(maybe_payload.get("error"), dict):
                 return {"error": maybe_payload["error"]}
         result: dict[str, Any] = {"deliveries": deliveries, "count": len(deliveries), "verified_sender": verified_sender}
+        delivery_errors = _delivery_failure_summaries(deliveries)
+        if delivery_errors:
+            result["delivery_state"] = (
+                "partial_failure"
+                if any(item.get("delivery_state") != "failed" for item in deliveries)
+                else "failed"
+            )
+            result["delivery_errors"] = delivery_errors
         if bridge_deliveries:
             result["remote_delivery_state"] = "queued_remote"
             result["bridge_deliveries"] = bridge_deliveries
@@ -9924,8 +10026,14 @@ def build_mcp_server() -> FastMCP:
                     topic=original.topic,
                 )
                 deliveries.append({"project": target_project.human_key, "payload": payload_ext})
-            except Exception:
-                continue
+            except Exception as exc:
+                deliveries.append(
+                    _external_delivery_failure(
+                        action="reply_message",
+                        project=target_project,
+                        exc=exc,
+                    )
+                )
 
         bridge_deliveries: list[dict[str, Any]] = []
         if remote_bridge_recipients:
@@ -9991,6 +10099,14 @@ def build_mcp_server() -> FastMCP:
         primary_payload["reply_to"] = message_id
         primary_payload["deliveries"] = deliveries
         primary_payload["count"] = len(deliveries)
+        delivery_errors = _delivery_failure_summaries(deliveries)
+        if delivery_errors:
+            primary_payload["delivery_state"] = (
+                "partial_failure"
+                if any(item.get("delivery_state") != "failed" for item in deliveries)
+                else "failed"
+            )
+            primary_payload["delivery_errors"] = delivery_errors
         if bridge_deliveries:
             primary_payload["remote_delivery_state"] = "queued_remote"
             primary_payload["bridge_deliveries"] = bridge_deliveries
@@ -10090,6 +10206,12 @@ def build_mcp_server() -> FastMCP:
                     task_description or "",
                     settings,
                 )
+                # Explicit provisioning must leave the new identity
+                # authenticated and usable.  The automatic send path is
+                # retired, but an explicit handshake with
+                # register_if_missing=true still has to mint its stable token
+                # before respond_contact can authenticate the target.
+                b, _ = await _ensure_agent_registration_token(b)
             else:
                 raise
         # Warn on TTL auto-correction
@@ -11101,6 +11223,11 @@ def build_mcp_server() -> FastMCP:
                         task_description or "",
                         settings,
                     )
+                    # Explicit provisioning must leave the target usable for
+                    # the approval step below.  Automatic recipient
+                    # registration is retired, but this explicit handshake
+                    # path is allowed to mint the stable token it needs.
+                    b, target_registration_token = await _ensure_agent_registration_token(b)
                 else:
                     raise
 
@@ -11203,6 +11330,18 @@ def build_mcp_server() -> FastMCP:
 
         response_result = None
         if auto_accept:
+            if register_if_missing and not target_registration_token:
+                # `request_contact` intentionally does not return bearer
+                # tokens.  Re-read the explicitly provisioned target here so
+                # the approval call can authenticate without exposing the
+                # token in the request response.
+                response_project = (
+                    await _get_project_by_identifier(target_project_key)
+                    if target_project_key
+                    else await _get_project_by_identifier(project_key)
+                )
+                target_agent = await _get_agent(response_project, real_target)
+                _, target_registration_token = await _ensure_agent_registration_token(target_agent)
             respond_tool = cast(FunctionTool, cast(Any, respond_contact))
             respond_payload: dict[str, Any] = {
                 "ctx": ctx,

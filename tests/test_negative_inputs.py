@@ -4,7 +4,9 @@ import pytest
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
 
+from mcp_agent_mail import config as _config
 from mcp_agent_mail.app import build_mcp_server
+from mcp_agent_mail.utils import slugify
 
 
 @pytest.mark.asyncio
@@ -82,3 +84,32 @@ async def test_unknown_recipient_reports_structured_error(isolated_env):
         )
         deliveries = success.data.get("deliveries") or []
         assert deliveries and deliveries[0].get("payload", {}).get("subject") == "Hello again"
+
+
+@pytest.mark.asyncio
+async def test_legacy_auto_register_override_cannot_mint_recipient(isolated_env, monkeypatch):
+    """A deployment override must not revive the retired registration path."""
+    monkeypatch.setenv("MESSAGING_AUTO_REGISTER_RECIPIENTS", "true")
+    _config.clear_settings_cache()
+    server = build_mcp_server()
+    async with Client(server) as client:
+        await client.call_tool("ensure_project", {"human_key": "/backend"})
+        await client.call_tool(
+            "register_agent",
+            {"project_key": "Backend", "program": "codex", "model": "local", "name": "GreenCastle"},
+        )
+        with pytest.raises(ToolError):
+            await client.call_tool(
+                "send_message",
+                {
+                    "project_key": "Backend",
+                    "sender_name": "GreenCastle",
+                    "to": ["BlueLake"],
+                    "subject": "No implicit identity",
+                    "body_md": "must fail closed",
+                },
+            )
+
+        agents_blocks = await client.read_resource(f"resource://agents/{slugify('/backend')}")
+        raw = agents_blocks[0].text if agents_blocks else "{}"
+        assert "BlueLake" not in raw

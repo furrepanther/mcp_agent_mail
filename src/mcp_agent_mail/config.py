@@ -484,7 +484,9 @@ def get_settings() -> Settings:
             default="demo,test*,testproj*,testproject,backendproj*,frontendproj*",
         ),
         agent_name_enforcement_mode=_agent_name_mode(_decouple_config("AGENT_NAME_ENFORCEMENT_MODE", default="coerce")),
-        messaging_auto_register_recipients=_bool(_decouple_config("MESSAGING_AUTO_REGISTER_RECIPIENTS", default="false"), default=False),
+        # Retained as a typed compatibility field, but send_message no longer
+        # auto-registers recipients.  Identity provisioning is explicit only.
+        messaging_auto_register_recipients=False,
         messaging_auto_handshake_on_block=_bool(_decouple_config("MESSAGING_AUTO_HANDSHAKE_ON_BLOCK", default="true"), default=True),
         window_identity_uuid=_decouple_config("MCP_AGENT_MAIL_WINDOW_ID", default="").strip(),
         window_identity_ttl_days=_int(_decouple_config("MCP_AGENT_MAIL_WINDOW_TTL_DAYS", default="30"), default=30),

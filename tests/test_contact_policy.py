@@ -243,10 +243,9 @@ async def test_macro_contact_handshake_registers_missing_target(isolated_env):
 
 
 @pytest.mark.asyncio
-async def test_send_message_supports_at_address(isolated_env):
+async def test_send_message_supports_project_qualified_address(isolated_env):
     backend = "/data/projects/smartedgar_mcp"
     frontend = "/data/projects/smartedgar_mcp_frontend"
-    frontend_slug = slugify(frontend)
     server = build_mcp_server()
     async with Client(server) as client:
         await client.call_tool("ensure_project", {"human_key": backend})
@@ -276,7 +275,7 @@ async def test_send_message_supports_at_address(isolated_env):
             {
                 "project_key": backend,
                 "sender_name": "BlueLake",
-                "to": [f"PinkDog@{frontend_slug}"],
+                    "to": [f"project:{frontend}#PinkDog"],
                 "subject": "AT Route",
                 "body_md": "hello",
             },
