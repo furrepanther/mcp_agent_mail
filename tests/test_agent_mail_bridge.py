@@ -55,6 +55,34 @@ def test_memory_fabric_mirror_loader_is_path_isolated_and_singleton(tmp_path):
     assert module_name not in sys.modules
 
 
+def test_memory_fabric_mirror_loader_allows_nested_unrelated_load(tmp_path):
+    """A module may load another path without deadlocking the global cache."""
+    nested_dir = tmp_path / "nested"
+    nested_dir.mkdir()
+    (nested_dir / "memfab_mcp_client.py").write_text(
+        "VALUE = 'nested'\n"
+        "def get_shared_memfab_client():\n"
+        "    return None\n",
+        encoding="utf-8",
+    )
+    outer_dir = tmp_path / "outer"
+    outer_dir.mkdir()
+    nested_path = str(nested_dir)
+    (outer_dir / "memfab_mcp_client.py").write_text(
+        "import mcp_agent_mail.app as app_module\n"
+        f"NESTED = app_module._load_memory_fabric_mirror_client_module({nested_path!r})\n"
+        "VALUE = NESTED.VALUE\n"
+        "def get_shared_memfab_client():\n"
+        "    return None\n",
+        encoding="utf-8",
+    )
+
+    loaded = app_module._load_memory_fabric_mirror_client_module(str(outer_dir))
+
+    assert loaded.VALUE == "nested"
+    assert len(app_module._MEMORY_FABRIC_CLIENT_MODULE_CACHE) <= app_module._MEMORY_FABRIC_CLIENT_MODULE_CACHE_MAX
+
+
 def test_memory_fabric_mirror_loader_cache_is_bounded_and_clearable(tmp_path):
     for index in range(app_module._MEMORY_FABRIC_CLIENT_MODULE_CACHE_MAX + 2):
         module_dir = tmp_path / f"client-{index}"

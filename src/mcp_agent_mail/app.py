@@ -111,6 +111,17 @@ logger = logging.getLogger(__name__)
 _MEMORY_FABRIC_CLIENT_MODULE_CACHE: OrderedDict[str, Any] = OrderedDict()
 _MEMORY_FABRIC_CLIENT_MODULE_CACHE_MAX = 8
 _MEMORY_FABRIC_CLIENT_MODULE_LOCK = threading.Lock()
+_MEMORY_FABRIC_CLIENT_MODULE_INFLIGHT: dict[str, "_MemoryFabricMirrorModuleLoad"] = {}
+_MEMORY_FABRIC_CLIENT_MODULE_CACHE_GENERATION = 0
+
+
+class _MemoryFabricMirrorModuleLoad:
+    """Coordinate one explicit-path module load without holding the cache lock."""
+
+    def __init__(self) -> None:
+        self.done = threading.Event()
+        self.module: Any | None = None
+        self.error: BaseException | None = None
 
 
 def _memory_fabric_client_module_name(cache_key: str) -> str:
@@ -122,9 +133,11 @@ def _memory_fabric_client_module_name(cache_key: str) -> str:
 
 def _clear_memory_fabric_mirror_client_module_cache() -> None:
     """Release dynamically loaded mirror modules during server shutdown."""
+    global _MEMORY_FABRIC_CLIENT_MODULE_CACHE_GENERATION
     with _MEMORY_FABRIC_CLIENT_MODULE_LOCK:
         cache_keys = tuple(_MEMORY_FABRIC_CLIENT_MODULE_CACHE)
         _MEMORY_FABRIC_CLIENT_MODULE_CACHE.clear()
+        _MEMORY_FABRIC_CLIENT_MODULE_CACHE_GENERATION += 1
         for cache_key in cache_keys:
             sys.modules.pop(_memory_fabric_client_module_name(cache_key), None)
 
@@ -146,13 +159,35 @@ def _load_memory_fabric_mirror_client_module(client_lib: str) -> Any:
         raise ImportError(f"memory fabric client module not found: {source_path}")
 
     cache_key = str(source_path)
+    module_name = _memory_fabric_client_module_name(cache_key)
     with _MEMORY_FABRIC_CLIENT_MODULE_LOCK:
         cached = _MEMORY_FABRIC_CLIENT_MODULE_CACHE.get(cache_key)
         if cached is not None:
             _MEMORY_FABRIC_CLIENT_MODULE_CACHE.move_to_end(cache_key)
             return cached
 
-        module_name = _memory_fabric_client_module_name(cache_key)
+        load = _MEMORY_FABRIC_CLIENT_MODULE_INFLIGHT.get(cache_key)
+        if load is None:
+            load = _MemoryFabricMirrorModuleLoad()
+            _MEMORY_FABRIC_CLIENT_MODULE_INFLIGHT[cache_key] = load
+            load_owner = True
+            load_generation = _MEMORY_FABRIC_CLIENT_MODULE_CACHE_GENERATION
+        else:
+            load_owner = False
+            load_generation = -1
+
+    if not load_owner:
+        # Wait for the same path's owner without blocking unrelated mirror
+        # paths or cache shutdown.  No clock-based termination is used here.
+        load.done.wait()
+        if load.error is not None:
+            raise load.error
+        if load.module is None:
+            raise ImportError(f"memory fabric client load ended without a module: {source_path}")
+        return load.module
+
+    module = None
+    try:
         spec = importlib.util.spec_from_file_location(module_name, source_path)
         if spec is None or spec.loader is None:
             raise ImportError(f"unable to create import spec for {source_path}")
@@ -160,25 +195,31 @@ def _load_memory_fabric_mirror_client_module(client_lib: str) -> Any:
         # Dataclasses and other module introspection expect the module to be
         # visible while exec_module runs.  This is not an import-path mutation.
         sys.modules[module_name] = module
-        try:
-            spec.loader.exec_module(module)
-            # The module only needs to be visible while exec_module runs.  Do
-            # not leave a private cache entry in process-global sys.modules;
-            # eviction or shutdown must never remove a name another loader
-            # happens to be using.
-            with suppress(BaseException):
-                sys.modules.pop(module_name, None)
-            while len(_MEMORY_FABRIC_CLIENT_MODULE_CACHE) >= _MEMORY_FABRIC_CLIENT_MODULE_CACHE_MAX:
-                evicted_key, _ = _MEMORY_FABRIC_CLIENT_MODULE_CACHE.popitem(last=False)
-                sys.modules.pop(_memory_fabric_client_module_name(evicted_key), None)
-            _MEMORY_FABRIC_CLIENT_MODULE_CACHE[cache_key] = module
-        except BaseException:
-            # Cover both module execution and cache/eviction failures so a
-            # private partially initialized module cannot survive in sys.modules.
-            with suppress(BaseException):
-                sys.modules.pop(module_name, None)
-            raise
+        spec.loader.exec_module(module)
+        # The module only needs to be visible while exec_module runs.  Do not
+        # leave a private cache entry in process-global sys.modules.
+        with suppress(BaseException):
+            sys.modules.pop(module_name, None)
+        with _MEMORY_FABRIC_CLIENT_MODULE_LOCK:
+            if _MEMORY_FABRIC_CLIENT_MODULE_CACHE_GENERATION == load_generation:
+                while len(_MEMORY_FABRIC_CLIENT_MODULE_CACHE) >= _MEMORY_FABRIC_CLIENT_MODULE_CACHE_MAX:
+                    evicted_key, _ = _MEMORY_FABRIC_CLIENT_MODULE_CACHE.popitem(last=False)
+                    sys.modules.pop(_memory_fabric_client_module_name(evicted_key), None)
+                _MEMORY_FABRIC_CLIENT_MODULE_CACHE[cache_key] = module
+            load.module = module
+            _MEMORY_FABRIC_CLIENT_MODULE_INFLIGHT.pop(cache_key, None)
+            load.done.set()
         return module
+    except BaseException as exc:
+        # Cover module execution and cache/eviction failures so a private
+        # partially initialized module cannot survive in sys.modules.
+        with suppress(BaseException):
+            sys.modules.pop(module_name, None)
+        with _MEMORY_FABRIC_CLIENT_MODULE_LOCK:
+            load.error = exc
+            _MEMORY_FABRIC_CLIENT_MODULE_INFLIGHT.pop(cache_key, None)
+            load.done.set()
+        raise
 
 
 def _is_machine_coordination_notice(
