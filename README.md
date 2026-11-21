@@ -10,6 +10,23 @@ Think of it as asynchronous email + directory + change-intent signaling for your
 
 Status: Under active development. The design is captured in detail in `project_idea_and_guide.md` (start with the original prompt at the top of that file).
 
+## Production bridge recovery and identity roles
+
+The cross-host production bridge is fail-closed by design. The authenticated
+transport mailbox is not the logical owner, the peer recipient, or the
+transport process. The authoritative fields are `owner_identity`,
+`peer_recipient_identity`, `transport_process`, and `transport_mailbox`.
+`recipient_identity` may appear as a compatibility alias; it must not be used
+to infer ownership.
+
+If a configured bridge identity is missing or fails authenticated refresh, the
+bridge must stop and report the exact scope. It must not register a new random
+agent, replace the configured mailbox, or replay the outbox. Recovery is an
+explicit operator action: restore the named identity and registration token in
+the bridge state store, verify the canonical project/host/role fields, then run
+the identity preflight and one bounded delivery reconciliation. A successful
+health probe alone is not proof of delivery.
+
 ## Why this exists
 
 Modern projects often run multiple coding agents at once (backend, frontend, scripts, infra). Without a shared coordination fabric, agents:
