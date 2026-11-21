@@ -162,13 +162,16 @@ def _load_memory_fabric_mirror_client_module(client_lib: str) -> Any:
         sys.modules[module_name] = module
         try:
             spec.loader.exec_module(module)
+            while len(_MEMORY_FABRIC_CLIENT_MODULE_CACHE) >= _MEMORY_FABRIC_CLIENT_MODULE_CACHE_MAX:
+                evicted_key, _ = _MEMORY_FABRIC_CLIENT_MODULE_CACHE.popitem(last=False)
+                sys.modules.pop(_memory_fabric_client_module_name(evicted_key), None)
+            _MEMORY_FABRIC_CLIENT_MODULE_CACHE[cache_key] = module
         except BaseException:
-            sys.modules.pop(module_name, None)
+            # Cover both module execution and cache/eviction failures so a
+            # private partially initialized module cannot survive in sys.modules.
+            with suppress(BaseException):
+                sys.modules.pop(module_name, None)
             raise
-        while len(_MEMORY_FABRIC_CLIENT_MODULE_CACHE) >= _MEMORY_FABRIC_CLIENT_MODULE_CACHE_MAX:
-            evicted_key, _ = _MEMORY_FABRIC_CLIENT_MODULE_CACHE.popitem(last=False)
-            sys.modules.pop(_memory_fabric_client_module_name(evicted_key), None)
-        _MEMORY_FABRIC_CLIENT_MODULE_CACHE[cache_key] = module
         return module
 
 
