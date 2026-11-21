@@ -9,6 +9,14 @@ from mcp_agent_mail.app import build_mcp_server
 from mcp_agent_mail.utils import slugify
 
 
+def test_auto_handshake_default_is_fail_closed(monkeypatch):
+    """An unset deployment knob must not silently approve a contact handshake."""
+    monkeypatch.delenv("MESSAGING_AUTO_HANDSHAKE_ON_BLOCK", raising=False)
+    _config.clear_settings_cache()
+    settings = _config.get_settings()
+    assert settings.messaging_auto_handshake_on_block is False
+
+
 @pytest.mark.asyncio
 async def test_invalid_project_or_agent_errors(isolated_env):
     server = build_mcp_server()

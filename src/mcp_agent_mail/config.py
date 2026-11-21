@@ -484,10 +484,12 @@ def get_settings() -> Settings:
             default="demo,test*,testproj*,testproject,backendproj*,frontendproj*",
         ),
         agent_name_enforcement_mode=_agent_name_mode(_decouple_config("AGENT_NAME_ENFORCEMENT_MODE", default="coerce")),
-        # Retained as a typed compatibility field, but send_message no longer
-        # auto-registers recipients.  Identity provisioning is explicit only.
+        # Retained as typed compatibility fields, but identity provisioning and
+        # contact handshakes are explicit only.  The application may still
+        # honor an explicit per-call opt-in; an unset deployment setting must
+        # remain fail-closed and must not silently mint or approve identities.
         messaging_auto_register_recipients=False,
-        messaging_auto_handshake_on_block=_bool(_decouple_config("MESSAGING_AUTO_HANDSHAKE_ON_BLOCK", default="true"), default=True),
+        messaging_auto_handshake_on_block=_bool(_decouple_config("MESSAGING_AUTO_HANDSHAKE_ON_BLOCK", default="false"), default=False),
         window_identity_uuid=_decouple_config("MCP_AGENT_MAIL_WINDOW_ID", default="").strip(),
         window_identity_ttl_days=_int(_decouple_config("MCP_AGENT_MAIL_WINDOW_TTL_DAYS", default="30"), default=30),
         memory_fabric_mirror_enabled=_bool(_decouple_config("MEMORY_FABRIC_MIRROR_ENABLED", default="false"), default=False),

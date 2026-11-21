@@ -58,6 +58,7 @@ async def test_contact_blocked_and_contacts_only(isolated_env, monkeypatch):
                 "to": ["BlueLake"],
                 "subject": "Hi",
                 "body_md": "ping",
+                "auto_contact_if_blocked": True,
             },
         )
         deliveries = r2.data.get("deliveries") or []
