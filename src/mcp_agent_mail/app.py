@@ -35,6 +35,7 @@ from typing import Any, AsyncContextManager, Callable, Mapping, Optional, Protoc
 from urllib.parse import parse_qsl
 import uuid
 
+import anyio
 import httpx
 from fastmcp import Context, FastMCP
 from git import Repo
@@ -46,6 +47,7 @@ from sqlalchemy.orm import aliased
 from . import rich_logger
 from .config import Settings, get_settings
 from .db import (
+    clear_database_state,
     ensure_schema,
     get_engine,
     get_immediate_session,
@@ -964,16 +966,27 @@ def _lifespan_factory(settings: Settings) -> Callable[[FastMCP], AsyncContextMan
                 dispose_task = asyncio.create_task(engine.dispose())
             if dispose_task is not None:
                 try:
-                    await asyncio.shield(dispose_task)
+                    # FastMCP tears down its AnyIO cancel scope while the
+                    # server lifespan is unwinding.  Shield engine disposal
+                    # from both cancellation systems so aiosqlite connections
+                    # are returned before the loop or transport disappears.
+                    with anyio.CancelScope(shield=True):
+                        await asyncio.shield(dispose_task)
                 except asyncio.CancelledError as exc:
                     cancelled = exc
-                    with suppress(BaseException):
-                        await dispose_task
+                    with anyio.CancelScope(shield=True):
+                        with suppress(BaseException):
+                            await dispose_task
                 except Exception:
-                    with suppress(BaseException):
-                        await dispose_task
+                    with anyio.CancelScope(shield=True):
+                        with suppress(BaseException):
+                            await dispose_task
             with suppress(BaseException):
                 clear_repo_cache()
+            if dispose_task is not None and dispose_task.done() and not dispose_task.cancelled():
+                with suppress(BaseException):
+                    if dispose_task.exception() is None:
+                        clear_database_state()
             if cancelled is not None:
                 raise cancelled
 
@@ -3263,7 +3276,10 @@ async def _get_project_by_identifier(identifier: str) -> Project:
                 )
             )
         )
-        project = result.scalars().first()
+        try:
+            project = result.scalars().first()
+        finally:
+            result.close()
         if project:
             return project
 
@@ -9898,7 +9914,14 @@ def build_mcp_server() -> FastMCP:
 
         async with get_session() as sx:
             existing = await sx.execute(select(Agent.name).where(Agent.project_id == project.id))
-            local_names = {row[0] for row in existing.fetchall()}
+            try:
+                local_names = {row[0] for row in existing.fetchall()}
+            finally:
+                # AsyncSession.close() does not reliably release a result
+                # cursor that has not been explicitly closed before an AnyIO
+                # cancellation boundary.  Close every routing result while
+                # the owning session is still active.
+                existing.close()
 
             class _ContactBlocked(Exception):
                 pass
@@ -9952,7 +9975,11 @@ def build_mcp_server() -> FastMCP:
                             )
                             .limit(1)
                         )
-                    rec = rows.first()
+                    try:
+                        rec = rows.first()
+                    finally:
+                        if rows is not None:
+                            rows.close()
                     if rec:
                         _link, target_project, target_agent = rec
                         recipient_policy = (getattr(target_agent, "contact_policy", "auto") or "auto").lower()
@@ -9969,12 +9996,12 @@ def build_mcp_server() -> FastMCP:
                         else:
                             local_bcc.append(nm)
 
-        try:
-            await _route(to_names, "to")
-            await _route(cc_list, "cc")
-            await _route(bcc_list, "bcc")
-        except _ContactBlocked:
-            return {"error": {"type": "CONTACT_BLOCKED", "message": "Recipient is not accepting messages."}}
+            try:
+                await _route(to_names, "to")
+                await _route(cc_list, "cc")
+                await _route(bcc_list, "bcc")
+            except _ContactBlocked:
+                return {"error": {"type": "CONTACT_BLOCKED", "message": "Recipient is not accepting messages."}}
 
         deliveries: list[dict[str, Any]] = []
         if local_to or local_cc or local_bcc:

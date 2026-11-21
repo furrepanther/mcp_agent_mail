@@ -31,6 +31,7 @@ from functools import wraps
 from pathlib import Path
 from typing import Any, TypeVar, cast
 
+import anyio
 from sqlalchemy.exc import OperationalError, TimeoutError as SATimeoutError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 from sqlmodel import SQLModel
@@ -582,13 +583,17 @@ async def get_session(*, check_circuit_breaker: bool = False) -> AsyncIterator[A
         yield session
     finally:
         # Ensure session close completes even under cancellation (anyio cancel scopes
-        # will raise asyncio.CancelledError which is BaseException in Python 3.14).
+        # will otherwise interrupt the aiosqlite worker while SQLAlchemy still owns
+        # the pooled connection.  asyncio.shield alone is insufficient here because
+        # FastMCP/AnyIO cancellation is delivered through an AnyIO cancel scope.
         close_task = asyncio.create_task(session.close())
         try:
-            await asyncio.shield(close_task)
+            with anyio.CancelScope(shield=True):
+                await asyncio.shield(close_task)
         except BaseException:
-            with suppress(BaseException):
-                await close_task
+            with anyio.CancelScope(shield=True):
+                with suppress(BaseException):
+                    await close_task
             raise
 
 
@@ -637,10 +642,12 @@ async def get_immediate_session(*, check_circuit_breaker: bool = False) -> Async
     finally:
         close_task = asyncio.create_task(session.close())
         try:
-            await asyncio.shield(close_task)
+            with anyio.CancelScope(shield=True):
+                await asyncio.shield(close_task)
         except BaseException:
-            with suppress(BaseException):
-                await close_task
+            with anyio.CancelScope(shield=True):
+                with suppress(BaseException):
+                    await close_task
             raise
 
 
@@ -716,7 +723,6 @@ async def ensure_schema(settings: Settings | None = None) -> None:
 
 def reset_database_state() -> None:
     """Test helper to reset global engine/session state."""
-    global _engine, _session_factory, _schema_ready, _schema_lock
     # Dispose any existing engine/pool first to avoid leaking file descriptors across tests.
     if _engine is not None:
         engine = _engine
@@ -743,6 +749,20 @@ def reset_database_state() -> None:
             # Last resort: sync pool disposal.
             with suppress(Exception):
                 engine.sync_engine.dispose()
+    clear_database_state()
+
+
+def clear_database_state() -> None:
+    """Forget the disposed engine so the next server lifecycle reinitializes cleanly.
+
+    FastMCP can create more than one in-process server lifecycle in a single
+    interpreter (the test client does this for every test).  Retaining a
+    disposed async engine and its loop-bound schema lock makes the next
+    lifecycle reuse stale pool state and can turn a clean shutdown into a
+    garbage-collector connection warning.  Callers must dispose the engine
+    first; this function only clears process-global references.
+    """
+    global _engine, _session_factory, _schema_ready, _schema_lock
     _engine = None
     _session_factory = None
     _schema_ready = False

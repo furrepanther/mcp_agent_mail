@@ -114,6 +114,12 @@ def isolated_env(tmp_path, monkeypatch):
     finally:
         # Close all cached Repo objects first (prevents file handle leaks)
         clear_repo_cache()
+        # Dispose the async SQLAlchemy engine before forcing GC.  Collecting
+        # first leaves aiosqlite connections visible to the collector as
+        # non-checked-in, which produces a real cleanup warning and can hide a
+        # leaked connection in the test suite.
+        clear_settings_cache()
+        reset_database_state()
 
         # Suppress ResourceWarnings during cleanup since Python 3.14 warns about resources
         # being cleaned up by GC, which is exactly what we want
@@ -144,9 +150,6 @@ def isolated_env(tmp_path, monkeypatch):
 
             # Force another GC to clean up any remaining references
             gc.collect()
-
-        clear_settings_cache()
-        reset_database_state()
 
         if db_path.exists():
             db_path.unlink()
