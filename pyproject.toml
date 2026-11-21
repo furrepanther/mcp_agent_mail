@@ -23,6 +23,7 @@ classifiers = [
   "Typing :: Typed",
 ]
 dependencies = [
+  "anyio>=4.6.0",
   "fastmcp>=2.10.5",
   "uvicorn[standard]>=0.32.0",
   "fastapi>=0.110.0",

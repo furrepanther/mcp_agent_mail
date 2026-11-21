@@ -1612,6 +1612,7 @@ source = { editable = "." }
 dependencies = [
     { name = "aiolimiter" },
     { name = "aiosqlite" },
+    { name = "anyio" },
     { name = "attrs" },
     { name = "authlib" },
     { name = "bleach" },
@@ -1669,6 +1670,7 @@ dev = [
 requires-dist = [
     { name = "aiolimiter", specifier = ">=1.1.0" },
     { name = "aiosqlite", specifier = ">=0.20.0" },
+    { name = "anyio", specifier = ">=4.6.0" },
     { name = "asyncpg", marker = "extra == 'postgres'", specifier = ">=0.30.0" },
     { name = "attrs", specifier = ">=24.2.0" },
     { name = "authlib", specifier = ">=1.5.2,<1.6" },
