@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import sqlite3
 import sys
+import threading
 
 import pytest
 from fastmcp import Client
@@ -81,6 +82,80 @@ def test_memory_fabric_mirror_loader_allows_nested_unrelated_load(tmp_path):
 
     assert loaded.VALUE == "nested"
     assert len(app_module._MEMORY_FABRIC_CLIENT_MODULE_CACHE) <= app_module._MEMORY_FABRIC_CLIENT_MODULE_CACHE_MAX
+
+
+def test_memory_fabric_mirror_loader_rejects_same_path_reentry(tmp_path):
+    """A client module cannot wait on its own in-flight load forever."""
+    module_path = tmp_path / "memfab_mcp_client.py"
+    module_path.write_text(
+        "import mcp_agent_mail.app as app_module\n"
+        f"app_module._load_memory_fabric_mirror_client_module({str(tmp_path)!r})\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="recursive memory fabric client load refused"):
+        app_module._load_memory_fabric_mirror_client_module(str(tmp_path))
+
+    cache_key = str(module_path.resolve())
+    module_name = app_module._memory_fabric_client_module_name(cache_key)
+    assert cache_key not in app_module._MEMORY_FABRIC_CLIENT_MODULE_INFLIGHT
+    assert module_name not in sys.modules
+
+
+def test_memory_fabric_mirror_loader_releases_waiter_after_owner_failure(tmp_path, monkeypatch):
+    """A real same-path waiter receives the owner's failure and is not stranded."""
+    native_event = threading.Event
+    owner_started = native_event()
+    allow_owner_failure = native_event()
+    waiter_entered = native_event()
+    monkeypatch.setattr(app_module, "_TEST_MIRROR_OWNER_STARTED", owner_started, raising=False)
+    monkeypatch.setattr(
+        app_module,
+        "_TEST_MIRROR_ALLOW_FAILURE",
+        allow_owner_failure,
+        raising=False,
+    )
+    module_path = tmp_path / "memfab_mcp_client.py"
+    module_path.write_text(
+        "import mcp_agent_mail.app as app_module\n"
+        "app_module._TEST_MIRROR_OWNER_STARTED.set()\n"
+        "app_module._TEST_MIRROR_ALLOW_FAILURE.wait()\n"
+        "raise RuntimeError('deliberate owner failure')\n",
+        encoding="utf-8",
+    )
+    cache_key = str(module_path.resolve())
+    module_name = app_module._memory_fabric_client_module_name(cache_key)
+
+    class _ObservedEvent:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def wait(self, *args, **kwargs):
+            waiter_entered.set()
+            return self._inner.wait(*args, **kwargs)
+
+        def set(self):
+            return self._inner.set()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        owner = pool.submit(app_module._load_memory_fabric_mirror_client_module, str(tmp_path))
+        assert owner_started.wait(timeout=2)
+        with app_module._MEMORY_FABRIC_CLIENT_MODULE_LOCK:
+            load = app_module._MEMORY_FABRIC_CLIENT_MODULE_INFLIGHT[cache_key]
+            load.done = _ObservedEvent(load.done)
+        waiter = pool.submit(app_module._load_memory_fabric_mirror_client_module, str(tmp_path))
+        try:
+            assert waiter_entered.wait(timeout=2)
+        finally:
+            allow_owner_failure.set()
+        with pytest.raises(RuntimeError, match="deliberate owner failure"):
+            owner.result(timeout=2)
+        with pytest.raises(RuntimeError, match="deliberate owner failure"):
+            waiter.result(timeout=2)
+
+    assert isinstance(load.error, RuntimeError)
+    assert cache_key not in app_module._MEMORY_FABRIC_CLIENT_MODULE_INFLIGHT
+    assert module_name not in sys.modules
 
 
 def test_memory_fabric_mirror_loader_cache_is_bounded_and_clearable(tmp_path):

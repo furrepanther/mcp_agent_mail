@@ -122,6 +122,7 @@ class _MemoryFabricMirrorModuleLoad:
         self.done = threading.Event()
         self.module: Any | None = None
         self.error: BaseException | None = None
+        self.owner_thread_id = threading.get_ident()
 
 
 def _memory_fabric_client_module_name(cache_key: str) -> str:
@@ -177,8 +178,13 @@ def _load_memory_fabric_mirror_client_module(client_lib: str) -> Any:
             load_generation = -1
 
     if not load_owner:
+        if load.owner_thread_id == threading.get_ident():
+            raise RuntimeError(
+                f"recursive memory fabric client load refused for {source_path}"
+            )
         # Wait for the same path's owner without blocking unrelated mirror
-        # paths or cache shutdown.  No clock-based termination is used here.
+        # paths or cache shutdown.  The owner always publishes a module or an
+        # exception from its finally block; no clock-based termination is used.
         load.done.wait()
         if load.error is not None:
             raise load.error
@@ -187,6 +193,7 @@ def _load_memory_fabric_mirror_client_module(client_lib: str) -> Any:
         return load.module
 
     module = None
+    failure: BaseException | None = None
     try:
         spec = importlib.util.spec_from_file_location(module_name, source_path)
         if spec is None or spec.loader is None:
@@ -207,19 +214,23 @@ def _load_memory_fabric_mirror_client_module(client_lib: str) -> Any:
                     sys.modules.pop(_memory_fabric_client_module_name(evicted_key), None)
                 _MEMORY_FABRIC_CLIENT_MODULE_CACHE[cache_key] = module
             load.module = module
-            _MEMORY_FABRIC_CLIENT_MODULE_INFLIGHT.pop(cache_key, None)
-            load.done.set()
         return module
     except BaseException as exc:
+        failure = exc
+        raise
+    finally:
         # Cover module execution and cache/eviction failures so a private
-        # partially initialized module cannot survive in sys.modules.
+        # partially initialized module cannot survive in sys.modules.  Publish
+        # completion in a finally path so every same-path waiter is released.
         with suppress(BaseException):
             sys.modules.pop(module_name, None)
-        with _MEMORY_FABRIC_CLIENT_MODULE_LOCK:
-            load.error = exc
-            _MEMORY_FABRIC_CLIENT_MODULE_INFLIGHT.pop(cache_key, None)
+        try:
+            with _MEMORY_FABRIC_CLIENT_MODULE_LOCK:
+                if failure is not None:
+                    load.error = failure
+                _MEMORY_FABRIC_CLIENT_MODULE_INFLIGHT.pop(cache_key, None)
+        finally:
             load.done.set()
-        raise
 
 
 def _is_machine_coordination_notice(
