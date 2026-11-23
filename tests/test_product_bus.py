@@ -1,40 +1,40 @@
-import asyncio
 import json
-from typing import Any, cast
+
+import pytest
+from fastmcp import Client
 
 from mcp_agent_mail.app import build_mcp_server
 from mcp_agent_mail.config import clear_settings_cache
 from mcp_agent_mail.db import ensure_schema, reset_database_state
 
 
-async def _call(tool_name: str, args: dict[str, Any]) -> Any:
-    # Use FastMCP internal call helper for consistency across versions
-    mcp = cast(Any, build_mcp_server())
-    _contents, structured = await mcp._mcp_call_tool(tool_name, args)
-    return structured
-
-
-def test_ensure_product_and_link_project(tmp_path, monkeypatch) -> None:
+@pytest.mark.asyncio
+async def test_ensure_product_and_link_project(tmp_path, monkeypatch) -> None:
     # Enable gated features for product bus
     monkeypatch.setenv("WORKTREES_ENABLED", "1")
     clear_settings_cache()
     reset_database_state()
-    asyncio.run(ensure_schema())
+    await ensure_schema()
     # Ensure product (unique ids to avoid cross-run collisions)
     unique = "_prod_" + hex(hash(str(tmp_path)) & 0xFFFFF)[2:]
-    prod = asyncio.run(_call("ensure_product", {"product_key": f"my-product{unique}", "name": f"My Product{unique}"}))
-    assert prod["product_uid"]
-    # Ensure project exists for linking via existing helper path: _get_project_by_identifier needs a row
-    # Use ensure_project tool to create project
-    project_result = asyncio.run(_call("ensure_project", {"human_key": str(tmp_path)}))
-    slug = project_result.get("slug") or project_result["project"]["slug"]
-    # Link
-    link = asyncio.run(_call("products_link", {"product_key": prod["product_uid"], "project_key": slug}))
-    assert link["linked"] is True
-    # Product resource lists the project
-    mcp = cast(Any, build_mcp_server())
-    res_list = asyncio.run(mcp._mcp_read_resource(f"resource://product/{prod['product_uid']}"))
-    assert res_list and getattr(res_list[0], "content", None)
-    payload = json.loads(res_list[0].content)
-    assert any(p["slug"] == slug for p in payload.get("projects", []))
+    server = build_mcp_server()
+    async with Client(server) as client:
+        product_result = await client.call_tool(
+            "ensure_product",
+            {"product_key": f"my-product{unique}", "name": f"My Product{unique}"},
+        )
+        product = product_result.data
+        assert product["product_uid"]
+        project_result = await client.call_tool("ensure_project", {"human_key": str(tmp_path)})
+        project = project_result.data
+        slug = project.get("slug") or project["project"]["slug"]
+        link_result = await client.call_tool(
+            "products_link",
+            {"product_key": product["product_uid"], "project_key": slug},
+        )
+        assert link_result.data["linked"] is True
+        resources = await client.read_resource(f"resource://product/{product['product_uid']}")
+        assert resources and resources[0].text
+        payload = json.loads(resources[0].text)
+        assert any(item["slug"] == slug for item in payload.get("projects", []))
 
