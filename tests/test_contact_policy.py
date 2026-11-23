@@ -50,6 +50,22 @@ async def test_contact_blocked_and_contacts_only(isolated_env, monkeypatch):
             "set_contact_policy",
             {"project_key": "Backend", "agent_name": "BlueLake", "policy": "contacts_only"},
         )
+        # An unset deployment option must not perform a handshake or approve a
+        # contact as a side effect of delivery.  The caller has to opt in.
+        with pytest.raises(ToolError):
+            await client.call_tool(
+                "send_message",
+                {
+                    "project_key": "Backend",
+                    "sender_name": "GreenCastle",
+                    "to": ["BlueLake"],
+                    "subject": "No implicit handshake",
+                    "body_md": "must remain blocked",
+                },
+            )
+
+        # The explicitly requested handshake remains a separate, observable
+        # operation and may unblock the same delivery.
         r2 = await client.call_tool(
             "send_message",
             {
