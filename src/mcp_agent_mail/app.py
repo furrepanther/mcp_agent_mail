@@ -6408,6 +6408,31 @@ def build_mcp_server() -> FastMCP:
             return await _get_agent_by_id(project, bound_agent_ids[0])
         return None
 
+    def _require_active_agent(agent: Agent, *, action: str) -> None:
+        """Reject retired identities before a token or session can authorize work."""
+        if getattr(agent, "retired_at", None) is None:
+            return
+        raise ToolExecutionError(
+            "AGENT_RETIRED",
+            (
+                f"Agent '{agent.name}' is retired and cannot {action}. "
+                "A retired identity must be explicitly restored before it can authenticate or send mail."
+            ),
+            recoverable=True,
+            data={"agent_name": agent.name, "retired_at": _iso(agent.retired_at), "action": action},
+        )
+
+    def _active_approved_link_clause() -> Any:
+        """Return the only contact-link state that may authorize delivery."""
+        now = _naive_utc()
+        return _sa_and(
+            cast(Any, AgentLink.status == "approved"),
+            _sa_or(
+                cast(Any, AgentLink.expires_ts).is_(None),
+                cast(Any, AgentLink.expires_ts) > now,
+            ),
+        )
+
     async def _authenticate_agent(
         ctx: Context,
         project: Project,
@@ -6416,8 +6441,11 @@ def build_mcp_server() -> FastMCP:
         *,
         token_param: str,
         action: str,
+        allow_retired: bool = False,
     ) -> Agent:
         agent = await _get_agent(project, agent_name)
+        if not allow_retired:
+            _require_active_agent(agent, action=action)
         if _session_is_bound_to_agent(ctx, project, agent):
             _bind_session_agent(ctx, project, agent)
             return agent
@@ -6475,6 +6503,7 @@ def build_mcp_server() -> FastMCP:
 
         agent = await _resolve_session_agent_for_project(ctx, project)
         if agent is not None:
+            _require_active_agent(agent, action=action)
             return agent
 
         raise ToolExecutionError(
@@ -7290,6 +7319,7 @@ def build_mcp_server() -> FastMCP:
             registration_token,
             token_param="registration_token",
             action="unretire_agent",
+            allow_retired=True,
         )
 
         async with get_session() as session:
@@ -8553,7 +8583,7 @@ def build_mcp_server() -> FastMCP:
                                 cast(Any, AgentLink.a_project_id) == project.id,
                                 cast(Any, AgentLink.a_agent_id) == sender.id,
                                 cast(Any, AgentLink.b_project_id) == project.id,
-                                cast(Any, AgentLink.status == "approved"),
+                                _active_approved_link_clause(),
                                 cast(Any, AgentLink.b_agent_id).in_(recipient_ids),
                             )
                         )
@@ -8660,7 +8690,7 @@ def build_mcp_server() -> FastMCP:
                                             cast(Any, AgentLink.a_agent_id) == sender.id,
                                             cast(Any, AgentLink.b_project_id) == project.id,
                                             cast(Any, AgentLink.b_agent_id) == rec.id,
-                                            cast(Any, AgentLink.status == "approved"),
+                                            _active_approved_link_clause(),
                                         )
                                         .limit(1)
                                     )
@@ -8864,7 +8894,7 @@ def build_mcp_server() -> FastMCP:
                             .where(
                                 cast(Any, AgentLink.a_project_id) == project.id,
                                 cast(Any, AgentLink.a_agent_id) == sender.id,
-                                cast(Any, AgentLink.status == "approved"),
+                                _active_approved_link_clause(),
                                 cast(Any, Project.id == target_project_override.id),
                                 cast(Any, func.lower(Agent.name) == lookup_value),
                             )
@@ -8878,7 +8908,7 @@ def build_mcp_server() -> FastMCP:
                             .where(
                                 cast(Any, AgentLink.a_project_id) == project.id,
                                 cast(Any, AgentLink.a_agent_id) == sender.id,
-                                cast(Any, AgentLink.status == "approved"),
+                                _active_approved_link_clause(),
                                 cast(Any, func.lower(Agent.name) == lookup_value),
                             )
                             .limit(1)
@@ -8982,7 +9012,7 @@ def build_mcp_server() -> FastMCP:
                                                 .where(
                                                     cast(Any, AgentLink.a_project_id) == project.id,
                                                     cast(Any, AgentLink.a_agent_id) == sender.id,
-                                                    cast(Any, AgentLink.status == "approved"),
+                                                    _active_approved_link_clause(),
                                                     cast(Any, Project.id == tproj.id),
                                                     cast(Any, func.lower(Agent.name) == lookup_value),
                                                 )
@@ -10054,7 +10084,7 @@ def build_mcp_server() -> FastMCP:
                             .where(
                                 cast(Any, AgentLink.a_project_id) == project.id,
                                 cast(Any, AgentLink.a_agent_id) == sender.id,
-                                cast(Any, AgentLink.status == "approved"),
+                                _active_approved_link_clause(),
                                 cast(Any, Project.id == target_project_override.id),
                                 cast(Any, Agent.name == target_name_override),
                             )
@@ -10068,7 +10098,7 @@ def build_mcp_server() -> FastMCP:
                             .where(
                                 cast(Any, AgentLink.a_project_id) == project.id,
                                 cast(Any, AgentLink.a_agent_id) == sender.id,
-                                cast(Any, AgentLink.status == "approved"),
+                                _active_approved_link_clause(),
                                 cast(Any, Agent.name == nm),
                             )
                             .limit(1)
