@@ -208,7 +208,7 @@ def _load_memory_fabric_mirror_client_module(client_lib: str) -> Any:
         with suppress(BaseException):
             sys.modules.pop(module_name, None)
         with _MEMORY_FABRIC_CLIENT_MODULE_LOCK:
-            if _MEMORY_FABRIC_CLIENT_MODULE_CACHE_GENERATION == load_generation:
+            if load_generation == _MEMORY_FABRIC_CLIENT_MODULE_CACHE_GENERATION:
                 while len(_MEMORY_FABRIC_CLIENT_MODULE_CACHE) >= _MEMORY_FABRIC_CLIENT_MODULE_CACHE_MAX:
                     evicted_key, _ = _MEMORY_FABRIC_CLIENT_MODULE_CACHE.popitem(last=False)
                     sys.modules.pop(_memory_fabric_client_module_name(evicted_key), None)
