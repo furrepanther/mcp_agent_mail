@@ -6525,6 +6525,7 @@ def build_mcp_server() -> FastMCP:
     ) -> Agent:
         agent = await _resolve_session_agent_for_project(ctx, project)
         if agent is not None:
+            _require_active_agent(agent, action=action)
             return agent
 
         if project.id is None:
@@ -6559,6 +6560,7 @@ def build_mcp_server() -> FastMCP:
 
         for token_agent in token_agents:
             if token_agent.registration_token and hmac.compare_digest(provided_token, token_agent.registration_token):
+                _require_active_agent(token_agent, action=action)
                 _bind_session_agent(ctx, project, token_agent)
                 return token_agent
 
@@ -6596,6 +6598,7 @@ def build_mcp_server() -> FastMCP:
                 agent = await _find_agent_optional(project, agent_name)
                 if agent is None:
                     continue
+                _require_active_agent(agent, action=action)
                 if _session_is_bound_to_agent(ctx, project, agent):
                     _bind_session_agent(ctx, project, agent)
                     authorized.append((project, agent))
@@ -6608,6 +6611,7 @@ def build_mcp_server() -> FastMCP:
             else:
                 session_agent = await _resolve_session_agent_for_project(ctx, project)
                 if session_agent is not None:
+                    _require_active_agent(session_agent, action=action)
                     authorized.append((project, session_agent))
 
         if authorized:

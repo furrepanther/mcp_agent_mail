@@ -104,6 +104,69 @@ async def test_retired_identity_cannot_reuse_bound_session_or_registration_token
 
 
 @pytest.mark.asyncio
+async def test_retired_identity_cannot_administer_project_or_product_surfaces(isolated_env, monkeypatch):
+    """A retired identity loses every session and token authorization path."""
+    monkeypatch.setenv("WORKTREES_ENABLED", "1")
+    clear_settings_cache()
+    server = build_mcp_server()
+    project_key = "/identity/retired-admin-and-product"
+
+    async with Client(server) as client:
+        await client.call_tool("ensure_project", {"human_key": project_key})
+        agent = await client.call_tool(
+            "register_agent",
+            {
+                "project_key": project_key,
+                "program": "test",
+                "model": "test",
+                "name": "TealCove",
+            },
+        )
+        token = agent.data["registration_token"]
+        product = await client.call_tool(
+            "ensure_product",
+            {"product_key": "retired-admin-product", "name": "Retired Admin Product"},
+        )
+        await client.call_tool(
+            "products_link",
+            {"product_key": product.data["product_uid"], "project_key": project_key},
+        )
+        await client.call_tool(
+            "retire_agent",
+            {
+                "project_key": project_key,
+                "agent_name": "TealCove",
+                "registration_token": token,
+            },
+        )
+
+        with pytest.raises(ToolError, match="retired and cannot"):
+            await client.call_tool("archive_project", {"project_key": project_key})
+        with pytest.raises(ToolError, match="retired and cannot"):
+            await client.call_tool(
+                "search_messages_product",
+                {"product_key": product.data["product_uid"], "query": "probe"},
+            )
+
+    async with Client(server) as fresh_client:
+        with pytest.raises(ToolError, match="retired and cannot"):
+            await fresh_client.call_tool(
+                "archive_project",
+                {"project_key": project_key, "registration_token": token},
+            )
+        with pytest.raises(ToolError, match="retired and cannot"):
+            await fresh_client.call_tool(
+                "search_messages_product",
+                {
+                    "product_key": product.data["product_uid"],
+                    "query": "probe",
+                    "agent_name": "TealCove",
+                    "registration_token": token,
+                },
+            )
+
+
+@pytest.mark.asyncio
 async def test_expired_approved_contact_link_cannot_authorize_delivery(isolated_env, monkeypatch):
     """A contact approval expires; stale rows must not retain delivery authority."""
     monkeypatch.setenv("CONTACT_ENFORCEMENT_ENABLED", "true")
