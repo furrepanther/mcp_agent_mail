@@ -2439,7 +2439,19 @@ _CANONICAL_BRIDGE_PROJECT_BY_HOST = {
     # Datacube's is the capitalized shared production path.
     "primus": "/home/antigravity",
 }
-_STALE_BRIDGE_AGENTS = {"swiftcat", "greenstone", "mister-fixit", "ambergrove", "tealcove"}
+_STALE_BRIDGE_AGENTS = {
+    "ambergrove",
+    "azureeagle",
+    "darkharbor",
+    "greenstone",
+    "mister-fixit",
+    "rubyanchor",
+    "sagegorge",
+    "stormycliff",
+    "swiftcat",
+    "tealcove",
+    "turquoisecastle",
+}
 _BRIDGE_ENVELOPE_MARKER_RE = re.compile(r"(?im)^\s*<!--\s*ag-bridge-id:\s*([^>\s]+)\s*-->\s*$")
 _BRIDGE_ENVELOPE_HEADER_RE = re.compile(
     r"(?im)^\s*Cross-system request from\s+(?P<host>[A-Za-z0-9_.:-]+)\s+"
@@ -9414,6 +9426,7 @@ def build_mcp_server() -> FastMCP:
             source_agent=source_agent,
             expected_recipients=to,
         )
+        local_bridge_agent_name = _canonical_local_bridge_agent_name(bridge_agent_name)
         invalid_local_targets = [
             str(item).strip()
             for item in to
@@ -9421,14 +9434,19 @@ def build_mcp_server() -> FastMCP:
                 not str(item).strip()
                 or "@" in str(item).strip()
                 or str(item).strip().casefold() in _STALE_BRIDGE_AGENTS
+                or str(item).strip().casefold() != local_bridge_agent_name.casefold()
             )
         ]
-        if invalid_local_targets:
+        if len(to) != 1 or invalid_local_targets:
             raise ToolExecutionError(
                 "INVALID_BRIDGE_RECIPIENT",
-                "Inbound bridge delivery contains a blank or stale local recipient identity.",
+                "Inbound bridge delivery must name exactly the canonical local recipient identity.",
                 recoverable=True,
-                data={"invalid_targets": invalid_local_targets, "to": to},
+                data={
+                    "invalid_targets": invalid_local_targets,
+                    "to": to,
+                    "expected_local_recipient": local_bridge_agent_name,
+                },
             )
         (
             normalized_attestation_version,
@@ -9565,7 +9583,6 @@ def build_mcp_server() -> FastMCP:
             remote_project_key=source_project_key,
             status="active",
         )
-        local_bridge_agent_name = _canonical_local_bridge_agent_name(bridge_agent_name)
         bridge_agent = await _get_or_create_agent(
             project,
             local_bridge_agent_name,

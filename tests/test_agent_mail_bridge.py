@@ -209,6 +209,12 @@ async def _upsert_peer(client, host_key, token, project_key="/peer-project"):
     ("host_key", "agent_name", "expected_error"),
     [
         ("Primus", "SwiftCat", "STALE_BRIDGE_IDENTITY"),
+        ("Primus", "TealCove", "STALE_BRIDGE_IDENTITY"),
+        ("Primus", "DarkHarbor", "STALE_BRIDGE_IDENTITY"),
+        ("Primus", "SageGorge", "STALE_BRIDGE_IDENTITY"),
+        ("Primus", "StormyCliff", "STALE_BRIDGE_IDENTITY"),
+        ("Primus", "RubyAnchor", "STALE_BRIDGE_IDENTITY"),
+        ("Primus", "TurquoiseCastle", "STALE_BRIDGE_IDENTITY"),
         ("Primus", "", "INVALID_BRIDGE_IDENTITY"),
         ("", "RoseStone", "INVALID_BRIDGE_IDENTITY"),
     ],
@@ -703,7 +709,7 @@ async def test_bridge_receive_preserves_remote_provenance(isolated_env, monkeypa
 
 @pytest.mark.asyncio
 async def test_bridge_receive_attested_digest_is_verified_and_idempotent(isolated_env, monkeypatch):
-    monkeypatch.setenv("AGENT_MAIL_HOST_KEY", "Datacube")
+    monkeypatch.setenv("AGENT_MAIL_HOST_KEY", "Primus")
     error_types = []
 
     def capture_tool_error(_tool_name, error):
@@ -960,7 +966,7 @@ async def test_schema_migrates_existing_sqlite_bridge_and_message_tables(isolate
 
 @pytest.mark.asyncio
 async def test_bridge_revision_lineage_is_scoped_to_project_and_remote_provenance(isolated_env, monkeypatch):
-    monkeypatch.setenv("AGENT_MAIL_HOST_KEY", "Datacube")
+    monkeypatch.setenv("AGENT_MAIL_HOST_KEY", "Primus")
     server = build_mcp_server()
     async with Client(server) as client:
         await _upsert_peer(client, "Datacube", "test-datacube-peer-token")
@@ -1031,7 +1037,7 @@ async def test_bridge_revision_lineage_is_scoped_to_project_and_remote_provenanc
 
 @pytest.mark.asyncio
 async def test_bridge_dedupe_scope_prevents_cross_project_remote_collision(isolated_env, monkeypatch):
-    monkeypatch.setenv("AGENT_MAIL_HOST_KEY", "Datacube")
+    monkeypatch.setenv("AGENT_MAIL_HOST_KEY", "Primus")
     server = build_mcp_server()
     async with Client(server) as client:
         await _upsert_peer(client, "Datacube", "test-datacube-peer-token")
@@ -1095,7 +1101,7 @@ async def test_bridge_dedupe_scope_prevents_cross_project_remote_collision(isola
 
 @pytest.mark.asyncio
 async def test_bridge_receive_concurrent_idempotent_retry_rereads_scoped_duplicate(isolated_env, monkeypatch):
-    monkeypatch.setenv("AGENT_MAIL_HOST_KEY", "Datacube")
+    monkeypatch.setenv("AGENT_MAIL_HOST_KEY", "Primus")
     server = build_mcp_server()
     original_create_message = app_module._create_message
     injected_race = False
@@ -1147,7 +1153,7 @@ async def test_bridge_receive_concurrent_idempotent_retry_rereads_scoped_duplica
 
 @pytest.mark.asyncio
 async def test_legacy_history_can_be_superseded_but_not_retroactively_attested(isolated_env, monkeypatch):
-    monkeypatch.setenv("AGENT_MAIL_HOST_KEY", "Datacube")
+    monkeypatch.setenv("AGENT_MAIL_HOST_KEY", "Primus")
     server = build_mcp_server()
     async with Client(server) as client:
         await _upsert_peer(client, "Datacube", "test-datacube-peer-token")
@@ -1357,7 +1363,7 @@ async def test_flush_migrated_legacy_delivery_uses_legacy_wire_shape(isolated_en
                 "project_key": "/home/Antigravity",
                 "program": "codex",
                 "model": "gpt-5",
-                "name": "RoseStone",
+                "name": "PurpleCanyon",
             },
         )
         await client.call_tool(
@@ -1366,7 +1372,7 @@ async def test_flush_migrated_legacy_delivery_uses_legacy_wire_shape(isolated_en
                 "project_key": "/home/Antigravity",
                 "program": "codex",
                 "model": "gpt-5",
-                "name": "RoseStone",
+                "name": "PurpleCanyon",
             },
         )
         await client.call_tool(
@@ -1382,7 +1388,7 @@ async def test_flush_migrated_legacy_delivery_uses_legacy_wire_shape(isolated_en
             "bridge_receive_message",
             {
                 "project_key": "/home/Antigravity",
-                "to": ["RoseStone"],
+                "to": ["PurpleCanyon"],
                 "subject": "Migrated legacy source",
                 "body_md": "legacy body",
                 "source_host": "Primus",
@@ -1457,7 +1463,7 @@ async def test_bridge_rejects_remote_export_of_cross_origin_supersession(isolate
             "bridge_receive_message",
             {
                 "project_key": "/home/Antigravity",
-                "to": ["RoseStone"],
+                "to": ["PurpleCanyon"],
                 "subject": "Remote root",
                 "body_md": inbound_body,
                 "source_host": "Primus",
@@ -1498,7 +1504,7 @@ async def test_bridge_rejects_remote_export_of_cross_origin_supersession(isolate
 
 @pytest.mark.asyncio
 async def test_bridge_receive_peer_token_enforced_when_configured(isolated_env, monkeypatch):
-    monkeypatch.setenv("AGENT_MAIL_HOST_KEY", "Datacube")
+    monkeypatch.setenv("AGENT_MAIL_HOST_KEY", "Primus")
     server = build_mcp_server()
     async with Client(server) as client:
         await client.call_tool("ensure_project", {"human_key": "/home/antigravity"})
@@ -1548,7 +1554,8 @@ async def test_bridge_receive_peer_token_enforced_when_configured(isolated_env, 
 
 
 @pytest.mark.asyncio
-async def test_bridge_receive_fails_closed_for_unknown_or_missing_peer_token(isolated_env):
+async def test_bridge_receive_fails_closed_for_unknown_or_missing_peer_token(isolated_env, monkeypatch):
+    monkeypatch.setenv("AGENT_MAIL_HOST_KEY", "Primus")
     server = build_mcp_server()
     async with Client(server) as client:
         await client.call_tool("ensure_project", {"human_key": "/home/antigravity"})
@@ -1558,14 +1565,14 @@ async def test_bridge_receive_fails_closed_for_unknown_or_missing_peer_token(iso
                 "project_key": "/home/antigravity",
                 "program": "codex",
                 "model": "gpt-5",
-                "name": "PurpleCanyon",
+                "name": "RoseStone",
             },
         )
         unknown_peer = await client.call_tool_mcp(
             "bridge_receive_message",
             {
                 "project_key": "/home/antigravity",
-                "to": ["PurpleCanyon"],
+                "to": ["RoseStone"],
                 "subject": "Unknown peer",
                 "body_md": "must not be accepted",
                 "source_host": "Datacube",
@@ -1582,7 +1589,7 @@ async def test_bridge_receive_fails_closed_for_unknown_or_missing_peer_token(iso
             "bridge_receive_message",
             {
                 "project_key": "/home/antigravity",
-                "to": ["PurpleCanyon"],
+                "to": ["RoseStone"],
                 "subject": "Missing token",
                 "body_md": "must not be accepted",
                 "source_host": "Datacube",
@@ -1643,6 +1650,51 @@ async def test_bridge_rejects_stale_and_blank_federated_identities(isolated_env,
         stale_text = " ".join(getattr(content, "text", "") for content in stale_inbound.content)
         assert stale_inbound.isError is True
         assert "stale agent identity" in stale_text
+
+
+@pytest.mark.asyncio
+async def test_bridge_rejects_noncanonical_local_recipient_before_persistence(isolated_env, monkeypatch):
+    monkeypatch.setenv("AGENT_MAIL_HOST_KEY", "Datacube")
+    server = build_mcp_server()
+    async with Client(server) as client:
+        await client.call_tool("ensure_project", {"human_key": "/home/Antigravity"})
+        await client.call_tool(
+            "register_agent",
+            {
+                "project_key": "/home/Antigravity",
+                "program": "workx",
+                "model": "local",
+                "name": "PurpleCanyon",
+            },
+        )
+        await _upsert_peer(client, "Primus", "test-primus-peer-token", "/home/antigravity")
+
+        failed = await client.call_tool_mcp(
+            "bridge_receive_message",
+            {
+                "project_key": "/home/Antigravity",
+                "to": ["TealCove"],
+                "subject": "Wrong local recipient",
+                "body_md": "must be rejected before persistence",
+                "source_host": "Primus",
+                "source_agent": "RoseStone",
+                "source_project_key": "/home/antigravity",
+                "peer_token": "test-primus-peer-token",
+                "external_message_id": "wrong-local-recipient-1",
+                "bridge_dedupe_id": "primus:wrong-local-recipient-1",
+            },
+        )
+
+        error_text = " ".join(getattr(content, "text", "") for content in failed.content)
+        assert failed.isError is True
+        assert "canonical local recipient" in error_text
+        async with get_session() as session:
+            count = (
+                await session.execute(
+                    text("SELECT COUNT(*) FROM messages WHERE subject = 'Wrong local recipient'")
+                )
+            ).scalar_one()
+        assert count == 0
 
 
 @pytest.mark.asyncio
