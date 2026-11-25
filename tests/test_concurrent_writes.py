@@ -33,6 +33,7 @@ async def _setup_project_and_agents(settings: _config.Settings) -> dict:
 
         # Create multiple agents with auto-generated adjective+noun names
         agents = []
+        tokens = {}
         for i in range(5):
             result = await client.call_tool(
                 "register_agent",
@@ -47,6 +48,16 @@ async def _setup_project_and_agents(settings: _config.Settings) -> dict:
             data = result.data if hasattr(result, "data") else {}
             if isinstance(data, dict) and "name" in data:
                 agents.append(data["name"])
+                tokens[data["name"]] = data["registration_token"]
+                await client.call_tool(
+                    "set_contact_policy",
+                    {
+                        "project_key": "/tmp/concurrent-test",
+                        "agent_name": data["name"],
+                        "policy": "open",
+                        "registration_token": data["registration_token"],
+                    },
+                )
 
         # Ensure we got all agents - fail fast if not
         assert len(agents) == 5, f"Expected 5 agents, got {len(agents)}: {agents}"
@@ -63,6 +74,7 @@ async def _setup_project_and_agents(settings: _config.Settings) -> dict:
         "project_id": project_id,
         "project_slug": "tmp-concurrent-test",
         "agents": agents,
+        "tokens": tokens,
     }
 
 
@@ -86,6 +98,7 @@ async def test_concurrent_message_sends(isolated_env):
             {
                 "project_key": "/tmp/concurrent-test",
                 "sender_name": sender,
+                "sender_token": data["tokens"][sender],
                 "to": [recipient],
                 "subject": subject,
                 "body_md": f"Message from {sender} to {recipient}",
@@ -125,6 +138,7 @@ async def test_concurrent_messages_to_same_thread(isolated_env):
             {
                 "project_key": "/tmp/concurrent-test",
                 "sender_name": sender,
+                "sender_token": data["tokens"][sender],
                 "to": [first_agent],
                 "subject": f"Thread Message {message_num}",
                 "body_md": f"Message {message_num} from {sender}",
@@ -163,6 +177,7 @@ async def test_concurrent_file_reservation_different_paths(isolated_env):
             {
                 "project_key": "/tmp/concurrent-test",
                 "agent_name": agent,
+                "registration_token": data["tokens"][agent],
                 "paths": [path],
                 "ttl_seconds": 3600,
                 "exclusive": True,
@@ -196,6 +211,7 @@ async def test_concurrent_file_reservation_same_path_conflict(isolated_env):
             {
                 "project_key": "/tmp/concurrent-test",
                 "agent_name": agent,
+                "registration_token": data["tokens"][agent],
                 "paths": ["shared/config.json"],
                 "ttl_seconds": 3600,
                 "exclusive": True,
@@ -229,6 +245,7 @@ async def test_concurrent_file_reservation_overlapping_globs(isolated_env):
             {
                 "project_key": "/tmp/concurrent-test",
                 "agent_name": data["agents"][0],
+                "registration_token": data["tokens"][data["agents"][0]],
                 "paths": ["src/**/*.py"],
                 "ttl_seconds": 3600,
                 "exclusive": True,
@@ -241,6 +258,7 @@ async def test_concurrent_file_reservation_overlapping_globs(isolated_env):
             {
                 "project_key": "/tmp/concurrent-test",
                 "agent_name": data["agents"][1],
+                "registration_token": data["tokens"][data["agents"][1]],
                 "paths": ["src/app.py"],
                 "ttl_seconds": 3600,
                 "exclusive": True,
@@ -273,6 +291,7 @@ async def test_concurrent_inbox_fetches(isolated_env):
                 {
                     "project_key": "/tmp/concurrent-test",
                     "sender_name": data["agents"][(i + 1) % 5],
+                    "sender_token": data["tokens"][data["agents"][(i + 1) % 5]],
                     "to": [data["agents"][0]],
                     "subject": f"Test Message {i}",
                     "body_md": f"Body {i}",
@@ -286,6 +305,7 @@ async def test_concurrent_inbox_fetches(isolated_env):
                 {
                     "project_key": "/tmp/concurrent-test",
                     "agent_name": data["agents"][0],
+                    "registration_token": data["tokens"][data["agents"][0]],
                     "limit": 100,
                 },
             )
@@ -316,6 +336,7 @@ async def test_concurrent_inbox_fetch_during_message_send(isolated_env):
             {
                 "project_key": "/tmp/concurrent-test",
                 "sender_name": data["agents"][1],
+                "sender_token": data["tokens"][data["agents"][1]],
                 "to": [data["agents"][0]],
                 "subject": f"Concurrent Send {i}",
                 "body_md": f"Body {i}",
@@ -330,6 +351,7 @@ async def test_concurrent_inbox_fetch_during_message_send(isolated_env):
             {
                 "project_key": "/tmp/concurrent-test",
                 "agent_name": data["agents"][0],
+                "registration_token": data["tokens"][data["agents"][0]],
                 "limit": 100,
             },
         )
@@ -451,8 +473,9 @@ async def test_concurrent_message_read_write(isolated_env):
         async with get_session() as session:
             await session.execute(
                 text(
-                    "INSERT INTO messages (project_id, subject, body_md, importance, ack_required, sender_id, created_ts) "
-                    "VALUES (:pid, :subj, :body, :imp, :ack, 1, datetime('now'))"
+                    "INSERT INTO messages (project_id, subject, body_md, importance, ack_required, sender_id, created_ts, "
+                    "attestation_version, revision, attachments) "
+                    "VALUES (:pid, :subj, :body, :imp, :ack, 1, datetime('now'), 0, 0, '[]')"
                 ),
                 {"pid": project_id, "subj": f"Msg {i}", "body": f"Body {i}", "imp": "normal", "ack": 0},
             )

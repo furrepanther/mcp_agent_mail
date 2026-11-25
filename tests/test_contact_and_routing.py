@@ -7,7 +7,7 @@ from fastmcp import Client
 
 from mcp_agent_mail.app import build_mcp_server
 from mcp_agent_mail.config import get_settings
-from mcp_agent_mail.db import ensure_schema, get_session
+from mcp_agent_mail.db import ensure_schema, get_engine, get_session
 from mcp_agent_mail.models import Agent, AgentLink, Project
 
 
@@ -75,6 +75,9 @@ async def test_contact_auto_allow_same_thread(isolated_env):
             },
         )
         assert (third.data.get("deliveries") or [{}])[0].get("payload", {}).get("subject") == "Followup"
+        # Thread participant auto-allow must not leave a connection checked out
+        # after querying recipients from the thread.
+        assert get_engine().sync_engine.pool.checkedout() == 0
 
 
 @pytest.mark.asyncio
@@ -91,7 +94,14 @@ async def test_external_cross_project_routing(isolated_env):
         await s.refresh(p2)
         assert p1.id is not None
         assert p2.id is not None
-        a_sender = Agent(project_id=p1.id, name="Alpha", program="codex", model="gpt-5", task_description="")
+        a_sender = Agent(
+            project_id=p1.id,
+            name="Alpha",
+            program="codex",
+            model="gpt-5",
+            task_description="",
+            registration_token="alpha-token",
+        )
         b_recv = Agent(project_id=p2.id, name="Receiver", program="codex", model="gpt-5", task_description="")
         s.add(a_sender)
         s.add(b_recv)
@@ -118,6 +128,7 @@ async def test_external_cross_project_routing(isolated_env):
             {
                 "project_key": "Backend",
                 "sender_name": "Alpha",
+                "sender_token": "alpha-token",
                 "to": ["project:ops#Receiver"],
                 "subject": "Cross",
                 "body_md": "hello",

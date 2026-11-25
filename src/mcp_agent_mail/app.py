@@ -42,6 +42,13 @@ from sqlalchemy.orm import aliased
 
 from . import rich_logger
 from .config import Settings, get_settings
+from .bridge_identity import (
+    BridgeIdentityError,
+    configured_contract,
+    validate_local_identity,
+    validate_peer_identity,
+    validate_remote_recipient,
+)
 from .db import (
     ensure_schema,
     get_engine,
@@ -4268,10 +4275,44 @@ async def _queue_bridge_deliveries(
 ) -> list[dict[str, Any]]:
     if not remote_recipients:
         return []
+    try:
+        contract = validate_local_identity(sender.name)
+        for recipient in remote_recipients:
+            validate_remote_recipient(recipient["host_key"], recipient["agent_name"])
+    except BridgeIdentityError as exc:
+        raise ToolExecutionError(exc.code, str(exc), recoverable=False, data=exc.data) from exc
     await ensure_schema()
     now = _naive_utc()
-    source_host = _agent_mail_host_key()
+    source_host = contract.local_host
     queued: list[dict[str, Any]] = []
+    async with get_session() as peer_session:
+        for recipient in remote_recipients:
+            host_key = recipient["host_key"].strip()
+            peer_result = await peer_session.execute(
+                select(AgentMailPeer).where(func.lower(AgentMailPeer.host_key) == host_key.lower())
+            )
+            peer = peer_result.scalars().first()
+            if peer is None or not peer.enabled:
+                raise ToolExecutionError(
+                    "BRIDGE_PEER_NOT_CONFIGURED",
+                    f"Canonical peer {host_key!r} is not configured and enabled; refusing to queue delivery.",
+                    recoverable=False,
+                    data={"peer_host": host_key},
+                )
+            if not peer.auth_token_hash:
+                raise ToolExecutionError(
+                    "BRIDGE_PEER_AUTH_NOT_CONFIGURED",
+                    f"Canonical peer {host_key!r} has no peer token configured; refusing to queue delivery.",
+                    recoverable=False,
+                    data={"peer_host": host_key},
+                )
+            if not _bridge_outbound_peer_token(host_key):
+                raise ToolExecutionError(
+                    "BRIDGE_OUTBOUND_AUTH_NOT_CONFIGURED",
+                    f"No outbound peer token is configured for {host_key!r}; refusing to queue delivery.",
+                    recoverable=False,
+                    data={"peer_host": host_key},
+                )
     async with get_session() as session:
         if local_message_id is None:
             raise ToolExecutionError(
@@ -4481,6 +4522,22 @@ async def _flush_bridge_deliveries_once(
                 results.append({**_bridge_delivery_dict(current), "transport_state": "failed"})
                 processed += 1
                 continue
+            try:
+                validate_local_identity(current.source_agent)
+                validate_remote_recipient(current.dest_host, current.dest_agent)
+            except BridgeIdentityError as exc:
+                # A queued row can outlive a configuration correction.  Never
+                # replay it under a newly guessed identity; make the failure
+                # durable and visible instead.
+                blocked_error = f"{exc.code}: {exc}"
+                current.status = "blocked"
+                current.last_error = blocked_error[:2048]
+                current.updated_ts = now
+                session.add(current)
+                await session.commit()
+                results.append({**_bridge_delivery_dict(current), "transport_state": "blocked"})
+                processed += 1
+                continue
             snapshot_digest = getattr(current, "body_sha256", None)
             snapshot_version = int(getattr(current, "attestation_version", 0) or 0)
             snapshot_revision = int(getattr(current, "message_revision", 0) or 0)
@@ -4624,8 +4681,24 @@ async def _flush_bridge_deliveries_once(
                 }
             )
         peer_token = _bridge_outbound_peer_token(peer_host_key)
-        if peer_token:
-            args["peer_token"] = peer_token
+        if not peer_token:
+            blocked_error = "bridge peer outbound token is not configured"
+            async with get_session() as session:
+                current_result = await session.execute(
+                    select(AgentMailBridgeDelivery).where(AgentMailBridgeDelivery.id == delivery.id)
+                )
+                current = current_result.scalars().first()
+                if current is not None:
+                    current.status = "blocked"
+                    current.last_error = blocked_error
+                    current.updated_ts = _naive_utc()
+                    session.add(current)
+                    await session.commit()
+                    await session.refresh(current)
+                    results.append({**_bridge_delivery_dict(current), "transport_state": "blocked"})
+                    processed += 1
+            continue
+        args["peer_token"] = peer_token
 
         try:
             remote_payload = await _call_bridge_peer_tool(
@@ -7705,6 +7778,15 @@ def build_mcp_server() -> FastMCP:
         remote_bridge_recipients.extend(remote_to)
         remote_bridge_recipients.extend(remote_cc)
         remote_bridge_recipients.extend(remote_bcc)
+        if remote_bridge_recipients:
+            try:
+                validate_local_identity(sender_name)
+                for recipient in remote_bridge_recipients:
+                    validate_remote_recipient(recipient["host_key"], recipient["agent_name"])
+            except BridgeIdentityError as exc:
+                # Reject before any local delivery or bridge row is written so
+                # a stale identity cannot create a partial, unreplayable send.
+                raise ToolExecutionError(exc.code, str(exc), recoverable=False, data=exc.data) from exc
         if not to and not cc and not bcc and not remote_bridge_recipients:
             raise ToolExecutionError(
                 "RECIPIENT_NOT_FOUND",
@@ -7808,16 +7890,19 @@ def build_mcp_server() -> FastMCP:
                             .limit(500)
                         )
                         thread_rows = [(row[0], row[1]) for row in (await s.execute(stmt)).all()]
-                    # collect participants (sender names and recipients)
-                    participants: set[str] = {n for _m, n in thread_rows}
-                    message_ids = [m.id for m, _ in thread_rows if m.id is not None]
-                    if message_ids:
-                        recipient_rows = await s.execute(
-                            select(Agent.name)
-                            .join(MessageRecipient, cast(Any, MessageRecipient.agent_id) == Agent.id)
-                            .where(cast(Any, MessageRecipient.message_id).in_(message_ids))
-                        )
-                        participants.update({row[0] for row in recipient_rows.all() if row[0]})
+                        # The recipient lookup must use the still-open context.  The
+                        # previous code reused ``s`` after this context exited,
+                        # which caused SQLAlchemy to check out a new connection
+                        # that was never returned to the pool on threaded sends.
+                        message_ids = [m.id for m, _ in thread_rows if m.id is not None]
+                        participants: set[str] = {n for _m, n in thread_rows}
+                        if message_ids:
+                            recipient_rows = await s.execute(
+                                select(Agent.name)
+                                .join(MessageRecipient, cast(Any, MessageRecipient.agent_id) == Agent.id)
+                                .where(cast(Any, MessageRecipient.message_id).in_(message_ids))
+                            )
+                            participants.update({row[0] for row in recipient_rows.all() if row[0]})
                     auto_ok_names.update(participants)
                 except Exception:
                     logger.exception("Failed to fetch thread participants for contact auto-allow (thread_id=%s)", thread_id)
@@ -8620,6 +8705,16 @@ def build_mcp_server() -> FastMCP:
         normalized_host = host_key.strip()
         if not normalized_host:
             raise ToolExecutionError("INVALID_ARGUMENT", "host_key is required.", recoverable=True)
+        try:
+            contract = configured_contract()
+            if normalized_host.lower() != contract.peer_host.lower():
+                raise BridgeIdentityError(
+                    "BRIDGE_PEER_HOST_MISMATCH",
+                    f"Only the canonical peer {contract.peer_host!r} may be configured from {contract.local_host!r}.",
+                    data={"expected_host": contract.peer_host, "provided_host": normalized_host},
+                )
+        except BridgeIdentityError as exc:
+            raise ToolExecutionError(exc.code, str(exc), recoverable=False, data=exc.data) from exc
         if bridge_protocol_version is not None:
             try:
                 normalized_protocol_version = int(bridge_protocol_version)
@@ -8678,6 +8773,10 @@ def build_mcp_server() -> FastMCP:
         format: Optional[str] = None,
     ) -> dict[str, Any]:
         """Register or refresh one remote identity discovered from a peer."""
+        try:
+            validate_peer_identity(host_key, agent_name)
+        except BridgeIdentityError as exc:
+            raise ToolExecutionError(exc.code, str(exc), recoverable=False, data=exc.data) from exc
         identity = await _upsert_remote_identity_record(
             host_key=host_key,
             agent_name=agent_name,
@@ -8737,6 +8836,24 @@ def build_mcp_server() -> FastMCP:
                 "source_host and source_agent are required.",
                 recoverable=True,
             )
+        try:
+            contract = validate_peer_identity(source_host, source_agent)
+        except BridgeIdentityError as exc:
+            raise ToolExecutionError(exc.code, str(exc), recoverable=False, data=exc.data) from exc
+        if not source_project_key:
+            raise ToolExecutionError(
+                "BRIDGE_SOURCE_PROJECT_REQUIRED",
+                "source_project_key is required for canonical cross-host delivery; refusing ambiguous provenance.",
+                recoverable=False,
+            )
+        if bridge_agent_name and bridge_agent_name.strip().casefold() != contract.local_agent.casefold():
+            raise ToolExecutionError(
+                "BRIDGE_LOCAL_IDENTITY_MISMATCH",
+                f"bridge_agent_name must be the existing local owner {contract.local_agent!r}; "
+                f"refusing {bridge_agent_name!r}.",
+                recoverable=False,
+                data={"expected_agent": contract.local_agent, "provided_agent": bridge_agent_name},
+            )
         (
             normalized_attestation_version,
             normalized_digest,
@@ -8776,14 +8893,28 @@ def build_mcp_server() -> FastMCP:
                 select(AgentMailPeer).where(func.lower(AgentMailPeer.host_key) == source_host.lower())
             )
             peer = peer_result.scalars().first()
-            if (
-                peer is not None
-                and peer.auth_token_hash
-                and (
-                    not peer_token
-                    or not hmac.compare_digest(_hash_bridge_token(peer_token), peer.auth_token_hash)
+            if peer is None:
+                raise ToolExecutionError(
+                    "BRIDGE_PEER_NOT_CONFIGURED",
+                    f"Canonical peer {contract.peer_host!r} is not configured; refusing unauthenticated delivery.",
+                    recoverable=False,
+                    data={"peer_host": contract.peer_host},
                 )
-            ):
+            if not peer.enabled:
+                raise ToolExecutionError(
+                    "BRIDGE_PEER_DISABLED",
+                    f"Canonical peer {contract.peer_host!r} is disabled; refusing delivery.",
+                    recoverable=False,
+                    data={"peer_host": contract.peer_host},
+                )
+            if not peer.auth_token_hash:
+                raise ToolExecutionError(
+                    "BRIDGE_PEER_AUTH_NOT_CONFIGURED",
+                    f"Canonical peer {contract.peer_host!r} has no configured peer token; refusing delivery.",
+                    recoverable=False,
+                    data={"peer_host": contract.peer_host},
+                )
+            if not peer_token or not hmac.compare_digest(_hash_bridge_token(peer_token), peer.auth_token_hash):
                 raise ToolExecutionError(
                     "AUTHENTICATION_REQUIRED",
                     "Invalid or missing peer_token for bridge_receive_message.",
@@ -8873,15 +9004,10 @@ def build_mcp_server() -> FastMCP:
             remote_project_key=source_project_key,
             status="active",
         )
-        local_bridge_agent_name = bridge_agent_name or os.getenv("AGENT_MAIL_BRIDGE_AGENT_NAME", "AmberGrove")
-        bridge_agent = await _get_or_create_agent(
-            project,
-            local_bridge_agent_name,
-            "agent-mail-bridge",
-            "bridge",
-            f"Bridge receiver for {source_host}",
-            settings,
-        )
+        # The transport process is not a mailbox identity.  Use the already
+        # registered local owner and never create a synthetic relay agent on a
+        # timeout, retry, or missing-state path.
+        bridge_agent = await _get_agent(project, contract.local_agent)
         recipient_map = await _get_agents_batch(project, [item.strip() for item in to])
         recipients = [(recipient_map[item.strip()], "to") for item in to]
         try:

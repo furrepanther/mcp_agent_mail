@@ -66,7 +66,7 @@ async def test_missing_file_path_in_markdown_and_originals_toggle(isolated_env, 
     server = build_mcp_server()
     async with Client(server) as client:
         await client.call_tool("ensure_project", {"human_key": "/backend"})
-        await client.call_tool(
+        registration = await client.call_tool(
             "register_agent",
             {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
         )
@@ -75,6 +75,7 @@ async def test_missing_file_path_in_markdown_and_originals_toggle(isolated_env, 
             {
                 "project_key": "Backend",
                 "sender_name": "GreenCastle",
+                "sender_token": registration.data["registration_token"],
                 "to": ["GreenCastle"],
                 "subject": "MissingPath",
                 "body_md": f"![x]({image_path})",
@@ -90,13 +91,20 @@ async def test_missing_file_path_in_markdown_and_originals_toggle(isolated_env, 
     async with Client(server2) as client2:
         await client2.call_tool(
             "register_agent",
-            {"project_key": "Backend", "program": "codex", "model": "gpt-5", "name": "GreenCastle"},
+            {
+                "project_key": "Backend",
+                "program": "codex",
+                "model": "gpt-5",
+                "name": "GreenCastle",
+                "registration_token": registration.data["registration_token"],
+            },
         )
         res2 = await client2.call_tool(
             "send_message",
             {
                 "project_key": "Backend",
                 "sender_name": "GreenCastle",
+                "sender_token": registration.data["registration_token"],
                 "to": ["GreenCastle"],
                 "subject": "MissingPath2",
                 "body_md": f"![x]({image_path})",
@@ -123,3 +131,14 @@ async def test_async_file_lock_recovers_stale(tmp_path, monkeypatch):
     # Metadata should be cleaned up after release
     assert not metadata_path.exists()
     assert not lock_path.exists()
+
+
+def test_async_file_lock_destructor_survives_interpreter_teardown(monkeypatch):
+    """Telemetry cleanup must not raise after module globals are cleared."""
+    import mcp_agent_mail.storage as storage_module
+
+    lock = object.__new__(AsyncFileLock)
+    monkeypatch.setattr(storage_module, "_ACTIVE_LOCK_INSTANCES", None)
+    monkeypatch.setattr(storage_module, "_LOCK_INSTANCES_GUARD", None)
+
+    lock.__del__()

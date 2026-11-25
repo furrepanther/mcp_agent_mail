@@ -730,8 +730,21 @@ class AsyncFileLock:
             _ACTIVE_LOCK_INSTANCES[id(self)] = self
 
     def __del__(self) -> None:
-        with _LOCK_INSTANCES_GUARD:
-            _ACTIVE_LOCK_INSTANCES.pop(id(self), None)
+        # Destructors can run during interpreter teardown, after module
+        # globals have already been cleared.  Never let telemetry cleanup
+        # raise from __del__: that turns normal process shutdown into a noisy
+        # false failure and can hide the real lock lifecycle outcome.
+        instances = globals().get("_ACTIVE_LOCK_INSTANCES")
+        guard = globals().get("_LOCK_INSTANCES_GUARD")
+        if not isinstance(instances, dict) or guard is None:
+            return
+        try:
+            with guard:
+                instances.pop(id(self), None)
+        except Exception:
+            # Best-effort telemetry only; lock release is handled explicitly
+            # by the async context manager and must not depend on __del__.
+            return
 
     def _force_close_fd(self) -> bool:
         """Force-close the underlying SoftFileLock file descriptor if still open.
